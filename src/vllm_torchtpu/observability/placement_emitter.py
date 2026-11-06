@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""API-server-side emitter: publish the parallel config as a Prometheus info gauge.
+"""API-server-side emitter: publish the parallel config and rank placements.
 
-One gauge, value ``1`` with the facts in the labels (the
-``vllm:cache_config_info`` idiom): ``vllm:parallel_config_info`` once per
-engine. The same payload goes to the log once as a ``tpu_placement`` JSON
-line.
+``vllm:parallel_config_info`` is a gauge of value ``1`` with the facts in the
+labels (the ``vllm:cache_config_info`` idiom), once per engine. The same
+payload, plus every rank's placement, goes to the log once as a
+``tpu_placement`` JSON line.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.observability.placement_types import (
     PARALLEL_CONFIG_LABELS,
     ParallelSummary,
+    RankPlacement,
     label_names,
 )
 
@@ -86,7 +87,10 @@ def _gauge(name: str, documentation: str, labelnames: list[str]) -> Gauge:
     return _gauges[name]
 
 
-def emit_prometheus(summary: ParallelSummary, engines: Sequence[int]) -> None:
+def emit_prometheus(
+    summary: ParallelSummary, placements: Sequence[RankPlacement]
+) -> None:
+    """One ``vllm:parallel_config_info`` series per engine that reported ranks."""
     if vllm_exports_parallel_config_info():
         return
     gauge = _gauge(
@@ -94,46 +98,61 @@ def emit_prometheus(summary: ParallelSummary, engines: Sequence[int]) -> None:
         "Information of the LLMEngine ParallelConfig",
         label_names(PARALLEL_CONFIG_LABELS),
     )
-    for engine in engines:
+    for engine in sorted({p.dp_rank for p in placements}) or [0]:
         gauge.labels(**parallel_config_labels(summary, engine)).set(1)
 
 
-def emit_log(summary: ParallelSummary) -> None:
+def emit_log(summary: ParallelSummary, placements: Sequence[RankPlacement]) -> None:
     logger.info(
-        "tpu_placement %s", json.dumps({"parallel": summary.to_dict()}, sort_keys=True)
+        "tpu_placement %s",
+        json.dumps(
+            {"parallel": summary.to_dict(), "ranks": [p.to_dict() for p in placements]},
+            sort_keys=True,
+        ),
     )
 
 
-def managed_engines(
-    engine_client: EngineClient, parallel_config: ParallelConfig
-) -> list[int]:
-    """Data-parallel ranks served by this API server, one per engine core.
+async def collect_rank_placements(engine_client: EngineClient) -> list[RankPlacement]:
+    """Every rank's placement across every engine this API server manages.
 
-    The multiprocess core client lists them as ``engine_ranks_managed``; an
-    in-process engine serves only this node's own data-parallel rank.
+    ``EngineClient.collective_rpc`` returns only engine 0's result under data
+    parallelism, so the core client's all-engines utility call is used when
+    the client has one (``AsyncMPClient.call_utility_all_async``); arguments
+    mirror ``AsyncMPClient.collective_rpc_async``.
     """
+    rpc = ("collective_rpc", "get_placement", None, (), {})
     core = getattr(engine_client, "engine_core", None)
-    ranks = getattr(core, "engine_ranks_managed", None)
-    if ranks:
-        return sorted(int(rank) for rank in ranks)
-    return [parallel_config.data_parallel_rank]
+    if hasattr(core, "call_utility_all_async"):
+        per_engine = await core.call_utility_all_async(*rpc)
+    else:
+        per_engine = [await engine_client.collective_rpc("get_placement")]
+    return [_as_placement(row) for rows in per_engine for row in rows or () if row]
+
+
+def _as_placement(row: RankPlacement | dict) -> RankPlacement:
+    """collective_rpc may hand back the dataclass or its serialised dict."""
+    if isinstance(row, RankPlacement):
+        return row
+    return RankPlacement(**row)
 
 
 async def publish_placement(
     engine_client: EngineClient, vllm_config: VllmConfig
 ) -> None:
-    """Publish once. Failures are logged, never raised: this runs in server
-    startup and must not block serving."""
+    """Collect and publish once. Failures are logged, never raised: this runs
+    in server startup and must not block serving."""
     try:
-        parallel_config = vllm_config.parallel_config
-        summary = parallel_summary(parallel_config)
-        engines = managed_engines(engine_client, parallel_config)
-        emit_prometheus(summary, engines)
-        emit_log(summary)
+        placements = sorted(
+            await collect_rank_placements(engine_client),
+            key=lambda p: (p.dp_rank, p.rank),
+        )
+        summary = parallel_summary(vllm_config.parallel_config)
+        emit_prometheus(summary, placements)
+        emit_log(summary, placements)
         logger.info(
-            "Published %s for engine(s) %s.",
+            "Published %s and the placement of %d rank(s).",
             PARALLEL_CONFIG_METRIC,
-            ",".join(map(str, engines)),
+            len(placements),
         )
     except Exception as error:  # noqa: BLE001 - see docstring
         logger.warning("Could not publish TPU placement: %s", error)

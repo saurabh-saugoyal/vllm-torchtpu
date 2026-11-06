@@ -11,12 +11,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Typed records behind the TPU parallelism metrics."""
+"""Typed records describing where a rank sits in the engine's parallel groups."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from typing import Any
+
+Range = tuple[int, int]
+"""Half-open ``[start, stop)`` interval."""
+
+
+@dataclass(frozen=True)
+class RankPlacement:
+    """Everything one worker rank reports; serialisable with :func:`asdict`."""
+
+    rank: int
+    dp_rank: int
+    tp_rank: int
+    tp_size: int
+    pp_rank: int
+    pp_size: int
+    pcp_rank: int | None
+    dcp_rank: int | None
+    node_rank: int
+    layers: Range | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)

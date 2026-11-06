@@ -14,6 +14,7 @@
 """Static, boot-time observability for the TPU backend.
 
 ``placement_types`` holds the records and metric label sets,
-``placement_emitter`` publishes them from the API server and
-``placement_hook`` schedules that in the server's lifespan startup.
+``placement_provider`` fills them in on each worker, ``placement_emitter``
+publishes them from the API server and ``placement_hook`` schedules that in
+the server's lifespan startup.
 """
