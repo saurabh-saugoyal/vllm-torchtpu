@@ -141,7 +141,7 @@ unknown.
 ```text
 vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
   data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
-  decode_context_parallel_size="1", world_size="4", nnodes="1", device_kind="TPU v6e",
+  decode_context_parallel_size="1", world_size="4", nnodes="1", kv_role="", device_kind="TPU v6e",
   visible_chips="4", cores_per_chip="1"} 1
 
 vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0",
@@ -176,6 +176,7 @@ vllm:layer_placement_info * on(engine, rank) group_left(device_id, chip_coords, 
 
 | Label | Meaning |
 | :--- | :--- |
+| `kv_role` | `kv_producer` (prefill pool) or `kv_consumer` (decode pool) under [disaggregated serving](disaggregated_serving.md), from `--kv-transfer-config`; empty for a regular instance. Each pool is its own server with its own `/metrics`, so this is what tells them apart. |
 | `host_visible_chips` | Host chips the process may use (`TPU_VISIBLE_CHIPS`), e.g. `4-7` for the second engine of `DP=2` on an 8-chip host; empty when the whole host is visible. Under multi-process DP the runtime renumbers `device_id`/`chip_index`/`chip_coords` within this subset, so this is what distinguishes engines physically. |
 | `device_id`, `chip_coords`, `core_on_chip`, `chip_index` | The logical TPU device the rank is pinned to, its ICI coordinates, and which TensorCore of which physical chip that is. On TPU v7x two ranks share a `chip_index`. |
 | `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
