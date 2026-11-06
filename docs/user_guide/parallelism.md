@@ -118,3 +118,27 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --kv-cache-dtype fp8 \
   --max-model-len 65536
 ```
+
+---
+
+## 6. Observability: how the engine is parallelised
+
+Once the model is loaded and before the server accepts requests, `vllm-torchtpu`
+publishes a static Prometheus info gauge (value `1`, the same idiom as vLLM's
+`vllm:cache_config_info`) on the regular `/metrics` endpoint. It is set once
+and never changes for the life of the process, so a scraper keeps it for as
+long as its retention allows, which makes it usable for post-mortem analysis
+of a deployment that no longer exists.
+
+```text
+# One series per engine (data-parallel rank).
+vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
+  data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
+  decode_context_parallel_size="1", world_size="4", nnodes="1"} 1
+```
+
+The same payload is also written once to the server log as a single JSON line
+prefixed `rank_placement`, for installations without a metrics scraper.
+
+Set `VLLM_TPU_EMIT_PLACEMENT=0` to disable. `vllm:parallel_config_info` is
+skipped automatically on vLLM versions that publish it themselves.
