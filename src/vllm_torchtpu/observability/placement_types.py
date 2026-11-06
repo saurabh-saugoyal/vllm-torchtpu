@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Typed records behind the TPU parallelism report."""
+"""Typed records behind the TPU parallelism metrics."""
 
 from __future__ import annotations
 
@@ -34,3 +34,31 @@ class ParallelSummary:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class LabelSpec:
+    name: str
+    doc: str
+
+
+# Label value formats: [index] 0-based position; [count] size; [bool]
+# "True"/"False". Gauge value is always 1.
+
+PARALLEL_CONFIG_LABELS: tuple[LabelSpec, ...] = (
+    LabelSpec(
+        "engine", "[index] vLLM engine == data-parallel rank; joins vLLM's metrics"
+    ),
+    LabelSpec("tensor_parallel_size", "[count] ranks splitting each layer's heads"),
+    LabelSpec("pipeline_parallel_size", "[count] stages splitting the layer sequence"),
+    LabelSpec("data_parallel_size", "[count] engines (model replicas)"),
+    LabelSpec("enable_expert_parallel", "[bool] experts spread across TP x DP ranks"),
+    LabelSpec("prefill_context_parallel_size", "[count] ranks splitting a prefill"),
+    LabelSpec("decode_context_parallel_size", "[count] ranks splitting the KV cache"),
+    LabelSpec("world_size", "[count] worker processes per engine = TP x PP x PCP"),
+    LabelSpec("nnodes", "[count] hosts one engine spans; 1 unless --nnodes"),
+)
+
+
+def label_names(specs: tuple[LabelSpec, ...]) -> list[str]:
+    return [spec.name for spec in specs]
