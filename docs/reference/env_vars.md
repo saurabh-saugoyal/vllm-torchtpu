@@ -130,4 +130,4 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
-| `VLLM_TPU_EMIT_PLACEMENT` | `True` | Publishes `vllm:parallel_config_info` on `/metrics` and the `rank_placement` log line once at API-server startup. `0`/`false`/`no`/`off` disables it. Does not affect the compile cache. See [Parallelism & Scaling](../user_guide/parallelism.md#observability-how-the-engine-is-parallelised). |
+| `VLLM_TPU_EMIT_PLACEMENT` | `True` | Publishes `vllm:parallel_config_info` and `vllm:rank_placement_info` (which chip and layers each rank holds) on `/metrics`, and the `rank_placement` log lines, once at startup. `0`/`false`/`no`/`off` disables it. Does not affect the compile cache. See [Parallelism & Scaling](../user_guide/parallelism.md#observability-which-rank-holds-what). |

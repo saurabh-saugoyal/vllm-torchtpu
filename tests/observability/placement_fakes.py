@@ -13,8 +13,8 @@
 # limitations under the License.
 """Shared fakes for the placement tests.
 
-A minimal model with ``model.layers`` and pipeline bounds, and a stand-in for
-vLLM's parallel state.
+A minimal model with ``model.layers`` and pipeline bounds, a stand-in for
+vLLM's parallel state, and a no-op device probe.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+
+from vllm_torchtpu.observability.placement_types import DeviceIdentity
 
 
 class DenseLayer(torch.nn.Module):
@@ -67,3 +69,9 @@ def fake_parallel_state(monkeypatch, tp_rank, tp_size, pp=(0, 1), pcp=None, dcp=
     if dcp is not None:
         state.get_dcp_group = lambda: FakeGroup(*dcp)
     monkeypatch.setattr(placement_provider, "parallel_state", state)
+
+
+def no_device(monkeypatch) -> None:
+    from vllm_torchtpu.observability import placement_provider
+
+    monkeypatch.setattr(placement_provider, "describe_device", DeviceIdentity)

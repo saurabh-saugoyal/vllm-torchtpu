@@ -790,10 +790,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the in-tree experimental RPA kernel modules; see
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
-    # Publish the engine's parallel configuration (vllm:parallel_config_info
-    # and the rank_placement log line) once at API-server startup, before the
-    # server accepts requests (observability/placement_hook.py). Default on;
-    # 0/false/no/off turns it off. Startup diagnostics only, so listed in
+    # Publish the engine's parallel configuration and each rank's chip
+    # placement (vllm:parallel_config_info, vllm:rank_placement_info, and the
+    # rank_placement log lines) once at startup, before the server accepts
+    # requests (observability/placement_hook.py). Default on; 0/false/no/off
+    # turns it off. Startup diagnostics only, so listed in
     # _TPU_COMPILE_ENV_IGNORED.
     "VLLM_TPU_EMIT_PLACEMENT": env_bool("VLLM_TPU_EMIT_PLACEMENT", default=True),
     # Greedy steps without logprobs or grammar take the vocabulary-parallel

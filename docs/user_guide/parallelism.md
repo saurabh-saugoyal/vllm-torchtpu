@@ -148,24 +148,77 @@ Sizing:
 
 ---
 
-## 6. Observability: how the engine is parallelised
+## 6. Observability: which rank holds what
 
 Once the model is loaded and before the server accepts requests, `vllm-torchtpu`
-publishes a static Prometheus info gauge (value `1`, the same idiom as vLLM's
-`vllm:cache_config_info`) on the regular `/metrics` endpoint. It is set once
-and never changes for the life of the process, so a scraper keeps it for as
-long as its retention allows, which makes it usable for post-mortem analysis
+publishes two static Prometheus info gauges (value `1`, the same idiom as vLLM's
+`vllm:cache_config_info`) on the regular `/metrics` endpoint. They are set once
+and never change for the life of the process, so a scraper keeps them for as
+long as its retention allows, which makes them usable for post-mortem analysis
 of a deployment that no longer exists.
 
 ```text
 # One series per engine (data-parallel rank).
 vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
   data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
-  decode_context_parallel_size="1", world_size="4", nnodes="1"} 1
+  decode_context_parallel_size="1", world_size="4", nnodes="1", device_kind="TPU v6e",
+  visible_chips="4", cores_per_chip="1"} 1
+
+# One series per rank: where it runs and which layers it holds.
+vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0",
+  device_id="0", chip_index="0", core_on_chip="0", chip_coords="0,0,0", host_visible_chips="",
+  layers="0-31"} 1
 ```
 
-The same payload is also written once to the server log as a single JSON line
-prefixed `rank_placement`, for installations without a metrics scraper.
+### Device identity
+
+`device_id`, `chip_index` and `chip_coords` are in the engine's slice-wide
+runtime numbering: every worker of an engine sees the same slice, and ranks map
+onto it non-trivially (rank 0 is often not device 0), which is the reason to
+publish it. `host_visible_chips` is the host chip the worker process is pinned
+to (`TPU_VISIBLE_CHIPS`, the `/dev/vfio/N` index) and `node_rank` the host.
+Under multi-process data parallelism each engine's runtime renumbers its subset
+of chips from 0, so two engines on one host report the same `device_id`s and
+differ in `host_visible_chips`:
+
+| engine | rank | tp_rank | device_id | chip_index | chip_coords | host_visible_chips |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 0 | 0 | 0 | 2 | 1 | 0,1,0 | 0 |
+| 0 | 1 | 1 | 0 | 0 | 0,0,0 | 1 |
+| 0 | 2 | 2 | 1 | 2 | 1,0,0 | 2 |
+| 0 | 3 | 3 | 3 | 3 | 1,1,0 | 3 |
+| 1 | 0 | 0 | 2 | 1 | 0,1,0 | 4 |
+| 1 | 3 | 3 | 3 | 3 | 1,1,0 | 7 |
+
+(Qwen2.5-1.5B, DP=2 × TP=4 on one v6e 2x4 host.)
+
+Per-chip telemetry is keyed by the host chip. On GKE the
+`kubernetes_io:container_accelerator_*` metrics carry
+`accelerator_id="<slice id>-<host chip>"`, whose suffix is that index: for a
+pinned worker it equals `host_visible_chips`, and for an engine that sees the
+whole host the runtime numbers the chips in host order, so it equals
+`device_id` (a TP=4 engine on an idle 8-chip host took `device_id` 0–3 and GKE
+reported memory on `…-0` to `…-3`). Telemetry keyed by chip within the visible
+slice maps to `chip_index`. To join in PromQL, lift the suffix into a label:
+
+```promql
+label_replace(kubernetes_io:container_accelerator_memory_used,
+              "host_visible_chips", "$1", "accelerator_id", ".*-([0-9]+)$")
+```
+
+| Label | Meaning |
+| :--- | :--- |
+| `host_visible_chips` | Host chip(s) the worker process is pinned to (`TPU_VISIBLE_CHIPS`); one chip per worker under multi-process DP (`0`…`7` on an 8-chip host), empty when the whole host is visible. The physical identity of the chip, independent of per-engine renumbering. |
+| `device_id`, `chip_coords`, `core_on_chip`, `chip_index` | The logical TPU device the rank is pinned to in the engine's slice numbering, its ICI coordinates, and which TensorCore of which physical chip that is. On TPU v7x two ranks share a `chip_index`. |
+| `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
+| `node_rank` | Host of the engine's slice this rank runs on (`--nnodes` multi-host); `0` on single-host engines. |
+| `layers` | Transformer layers held by this pipeline stage (inclusive range, from the stage's own layer bounds). |
+
+The same facts are logged: every worker writes its own record as one JSON line
+prefixed `rank_placement` as soon as it has described itself in `load_model()`,
+before KV-cache sizing and compilation, so a rank that fails later, or a pod
+that dies before its first scrape, has still left its placement in the log; the
+API server logs the aggregate once more when it publishes the gauges.
 
 Set `VLLM_TPU_EMIT_PLACEMENT=0` to disable. `vllm:parallel_config_info` is
 skipped automatically on vLLM versions that publish it themselves.
