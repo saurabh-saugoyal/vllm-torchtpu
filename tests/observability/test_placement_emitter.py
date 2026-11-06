@@ -27,15 +27,33 @@ from vllm.config import ParallelConfig
 
 from vllm_torchtpu.observability import placement_emitter as emitter
 from vllm_torchtpu.observability.placement_types import (
+    LAYER_LABELS,
     PARALLEL_CONFIG_LABELS,
-    PLACEMENT_LABELS,
+    RANK_LABELS,
+    AttentionSharding,
     DeviceIdentity,
+    LayerGroup,
     RankPlacement,
     label_names,
 )
 
 
-def placement(rank, dp_rank=0, **overrides) -> RankPlacement:
+def placement(rank, dp_rank=0, groups=None, **overrides) -> RankPlacement:
+    if groups is None:
+        groups = (
+            LayerGroup(
+                root="model",
+                layers=tuple(range(32)),
+                attn=AttentionSharding(
+                    "full",
+                    (rank * 8, rank * 8 + 8),
+                    (rank * 2, rank * 2 + 2),
+                    False,
+                    32,
+                    8,
+                ),
+            ),
+        )
     base = dict(
         rank=rank,
         dp_rank=dp_rank,
@@ -48,6 +66,7 @@ def placement(rank, dp_rank=0, **overrides) -> RankPlacement:
         node_rank=0,
         device=DeviceIdentity(rank, "TPU v6e", (rank, 0, 0), 0, rank, 4, 1, None),
         layers=(0, 32),
+        layer_groups=groups,
     )
     base.update(overrides)
     return RankPlacement(**base)
@@ -92,15 +111,21 @@ def test_parallel_config_labels_exact():
 
 
 def test_placement_labels_exact():
+    group = LayerGroup(
+        "model",
+        tuple(range(32)),
+        attn=AttentionSharding("full", (8, 16), (2, 4), False, 32, 8),
+    )
     p = placement(
         1,
+        groups=(group,),
         pcp_rank=0,
         dcp_rank=1,
         node_rank=1,
         device=DeviceIdentity(1, "TPU v6e", (1, 0, 0), 0, 1, 4, 1, (4, 5, 6, 7)),
     )
-    labels = emitter.placement_labels(p)
-    assert labels == {
+    rank = emitter.rank_labels(p)
+    assert rank == {
         "engine": "0",
         "rank": "1",
         "tp_rank": "1",
@@ -115,13 +140,53 @@ def test_placement_labels_exact():
         "host_visible_chips": "4-7",
         "layers": "0-31",
     }
-    assert list(labels) == label_names(PLACEMENT_LABELS)
+    assert list(rank) == label_names(RANK_LABELS)
+    layer = emitter.layer_labels(p, group)
+    assert layer == {
+        "engine": "0",
+        "rank": "1",
+        "module": "model",
+        "layer_subset": "0-31",
+        "attention_kind": "full",
+        "q_heads": "8-15",
+        "kv_heads": "2-3",
+        "kv_replicated": "False",
+    }
+    assert list(layer) == label_names(LAYER_LABELS)
 
 
-def test_labels_without_device():
-    labels = emitter.placement_labels(placement(2, device=DeviceIdentity()))
+def test_rank_labels_without_device():
+    labels = emitter.rank_labels(placement(2, groups=(), device=DeviceIdentity()))
     assert labels["rank"] == "2" and labels["chip_coords"] == ""
-    assert labels["host_visible_chips"] == ""
+
+
+def test_layer_labels_blank_for_kinds_not_present():
+    labels = emitter.layer_labels(placement(1), LayerGroup("model", (1, 3)))
+    assert labels["attention_kind"] == "" and labels["q_heads"] == ""
+
+
+def test_one_layer_row_per_group():
+    groups = (
+        LayerGroup(
+            "model",
+            (0, 2),
+            attn=AttentionSharding("full", (8, 16), (0, 1), True, 16, 2),
+        ),
+        LayerGroup("model", (1, 3)),
+        LayerGroup(
+            "visual",
+            (0,),
+            attn=AttentionSharding("full", (0, 8), (0, 8), False, 16, 16),
+        ),
+    )
+    p = placement(1, groups=groups)
+    series = [emitter.layer_labels(p, g) for g in p.layer_groups]
+    assert [(s["module"], s["layer_subset"]) for s in series] == [
+        ("model", "0,2"),
+        ("model", "1,3"),
+        ("visual", "0"),
+    ]
+    assert series[0]["kv_heads"] == "0" and series[1]["q_heads"] == ""
 
 
 @pytest.mark.parametrize("bounds,text", [(None, ""), ((3, 4), "3"), ((8, 16), "8-15")])
@@ -169,8 +234,21 @@ def series(reg, name):
     }
 
 
-def test_emit_prometheus_one_series_per_rank_and_engine(registry):
-    ps = [placement(0), placement(1), placement(0, dp_rank=1), placement(1, dp_rank=1)]
+def test_emit_prometheus_one_rank_row_and_one_layer_row_per_group(registry):
+    hybrid = (
+        LayerGroup(
+            "model",
+            (0, 2),
+            attn=AttentionSharding("full", (0, 8), (0, 2), False, 16, 4),
+        ),
+        LayerGroup("model", (1, 3)),
+    )
+    ps = [
+        placement(0),
+        placement(1),
+        placement(0, dp_rank=1),
+        placement(1, dp_rank=1, groups=hybrid),
+    ]
     emitter.emit_prometheus(
         emitter.parallel_summary(parallel_config(data_parallel_size=2), ps), ps
     )
@@ -178,13 +256,19 @@ def test_emit_prometheus_one_series_per_rank_and_engine(registry):
     assert {dict(k)["engine"] for k in parallel} == {"0", "1"} and set(
         parallel.values()
     ) == {1.0}
-    per_rank = series(registry, emitter.PLACEMENT_METRIC)
-    assert {(dict(k)["engine"], dict(k)["rank"]) for k in per_rank} == {
+    ranks = series(registry, emitter.RANK_METRIC)
+    assert {(dict(k)["engine"], dict(k)["rank"]) for k in ranks} == {
         ("0", "0"),
         ("0", "1"),
         ("1", "0"),
         ("1", "1"),
     }
+    layers = series(registry, emitter.LAYER_METRIC)
+    assert len(layers) == 5  # 3 homogeneous ranks x 1 group + 1 hybrid rank x 2
+    assert (
+        sum(1 for k in layers if dict(k)["engine"] == "1" and dict(k)["rank"] == "1")
+        == 2
+    )
 
 
 def test_emit_prometheus_idempotent(registry):
@@ -192,7 +276,8 @@ def test_emit_prometheus_idempotent(registry):
     summary = emitter.parallel_summary(parallel_config(), ps)
     emitter.emit_prometheus(summary, ps)
     emitter.emit_prometheus(summary, ps)
-    assert len(series(registry, emitter.PLACEMENT_METRIC)) == 1
+    assert len(series(registry, emitter.RANK_METRIC)) == 1
+    assert len(series(registry, emitter.LAYER_METRIC)) == 1
 
 
 def test_parallel_config_metric_skipped_when_vllm_has_it(registry, monkeypatch):
@@ -200,7 +285,7 @@ def test_parallel_config_metric_skipped_when_vllm_has_it(registry, monkeypatch):
     ps = [placement(0)]
     emitter.emit_prometheus(emitter.parallel_summary(parallel_config(), ps), ps)
     assert series(registry, emitter.PARALLEL_CONFIG_METRIC) == {}
-    assert len(series(registry, emitter.PLACEMENT_METRIC)) == 1
+    assert len(series(registry, emitter.RANK_METRIC)) == 1
 
 
 def test_parallel_summary_reads_vllm_parallel_config_at_the_pin():
@@ -234,7 +319,7 @@ def test_emit_log_is_one_json_line(caplog):
     ]
     payload = json.loads(lines[0].split(" ", 1)[1])
     assert payload["parallel"]["tensor_parallel_size"] == 4
-    assert payload["ranks"][0]["device"]["device_kind"] == "TPU v6e"
+    assert payload["ranks"][0]["layer_groups"][0]["attn"]["q_heads"] == [0, 8]
 
 
 # --------------------------------------------------------------- collection
@@ -263,7 +348,7 @@ def test_collect_uses_all_engines():
     )
     assert [(p.dp_rank, p.rank) for p in got] == [(0, 0), (0, 1), (1, 0)]
     assert core.fan_out_calls == [("collective_rpc", "get_placement", None, (), {})]
-    assert isinstance(got[0].device, DeviceIdentity)
+    assert isinstance(got[0].layer_groups[0].attn, AttentionSharding)
 
 
 def test_collect_falls_back_to_collective_rpc():

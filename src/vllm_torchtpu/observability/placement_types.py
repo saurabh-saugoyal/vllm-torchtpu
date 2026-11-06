@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Typed records describing where a rank runs.
+"""Typed records describing where a rank runs and which slice of a model it holds.
 
 Vocabulary: a *slice* is every chip the engine's workers can see; a *chip* sits
 at ``chip_coords`` in the ICI mesh and holds ``cores_per_chip`` TensorCores; one
@@ -45,6 +45,30 @@ class DeviceIdentity:
 
 
 @dataclass(frozen=True)
+class AttentionSharding:
+    """Heads one tensor-parallel rank computes in a softmax-attention layer."""
+
+    kind: str
+    q_heads: Range
+    kv_heads: Range
+    kv_replicated: bool
+    total_q_heads: int
+    total_kv_heads: int
+
+
+@dataclass(frozen=True)
+class LayerGroup:
+    """Layers of one root module that shard identically on this rank."""
+
+    root: str
+    layers: tuple[int, ...]
+    attn: AttentionSharding | None = None
+
+    def sharding_key(self) -> tuple:
+        return (self.root, self.attn)
+
+
+@dataclass(frozen=True)
 class RankPlacement:
     """Everything one worker rank reports; serialisable with :func:`asdict`."""
 
@@ -59,6 +83,7 @@ class RankPlacement:
     node_rank: int
     device: DeviceIdentity
     layers: Range | None = None
+    layer_groups: tuple[LayerGroup, ...] = ()
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -94,7 +119,7 @@ class LabelSpec:
 # Label value formats: [index] 0-based position; [count] size; [bool]
 # "True"/"False"; [range] inclusive "a-b" ("a" if one element); [id list]
 # compressed "0-2,5,9-11"; [x,y,z] comma-separated ints; [text] runtime string.
-# "" means not applicable. Gauge value is always 1.
+# "" means not applicable to this row's kind. Gauge value is always 1.
 
 PARALLEL_CONFIG_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec(
@@ -113,7 +138,7 @@ PARALLEL_CONFIG_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec("cores_per_chip", "[count] TensorCores per chip: 1 on v5e/v6e, 2 on v7x"),
 )
 
-PLACEMENT_LABELS: tuple[LabelSpec, ...] = (
+RANK_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec("engine", "[index] engine this rank belongs to"),
     LabelSpec("rank", "[index] worker process within the engine, 0..world_size-1"),
     LabelSpec("tp_rank", "[index] position in the tensor-parallel group"),
@@ -135,6 +160,21 @@ PLACEMENT_LABELS: tuple[LabelSpec, ...] = (
         "host_visible_chips", "[id list] TPU_VISIBLE_CHIPS pin; '' if whole host"
     ),
     LabelSpec("layers", "[range] layers held by this pipeline stage"),
+)
+
+LAYER_LABELS: tuple[LabelSpec, ...] = (
+    LabelSpec("engine", "[index] engine this rank belongs to"),
+    LabelSpec("rank", "[index] worker process within the engine"),
+    LabelSpec("module", "[text] root module of the layers, e.g. 'model', 'visual'"),
+    LabelSpec("layer_subset", "[id list] layers of `module` sharing this sharding"),
+    LabelSpec(
+        "attention_kind", "[text] 'full' (softmax, KV cache); '' if no attention"
+    ),
+    LabelSpec("q_heads", "[range] query heads this rank computes"),
+    LabelSpec("kv_heads", "[range] KV heads this rank holds; one head when replicated"),
+    LabelSpec(
+        "kv_replicated", "[bool] num_kv_heads < TP: a KV head is shared by ranks"
+    ),
 )
 
 

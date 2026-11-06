@@ -151,24 +151,49 @@ Sizing:
 ## 6. Observability: which rank holds what
 
 Once the model is loaded and before the server accepts requests, `vllm-torchtpu`
-publishes two static Prometheus info gauges (value `1`, the same idiom as vLLM's
-`vllm:cache_config_info`) on the regular `/metrics` endpoint. They are set once
-and never change for the life of the process, so a scraper keeps them for as
-long as its retention allows, which makes them usable for post-mortem analysis
-of a deployment that no longer exists.
+publishes three static Prometheus info gauges (value `1`, the same idiom as
+vLLM's `vllm:cache_config_info`) on the regular `/metrics` endpoint. They are
+set once and never change for the life of the process, so a scraper keeps them
+for as long as its retention allows, which makes them usable for post-mortem
+analysis of a deployment that no longer exists. Each gauge has one unit of
+cardinality; an empty label value means *not applicable to this row*, never
+unknown.
+
+| Gauge | One series per | Key |
+| :--- | :--- | :--- |
+| `vllm:parallel_config_info` | engine (data-parallel rank) | `engine` |
+| `vllm:rank_placement_info` | worker rank | `engine, rank` |
+| `vllm:layer_placement_info` | rank × group of identically sharded layers | `engine, rank, module, layer_subset` |
 
 ```text
-# One series per engine (data-parallel rank).
 vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
   data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
   decode_context_parallel_size="1", world_size="4", nnodes="1", device_kind="TPU v6e",
   visible_chips="4", cores_per_chip="1"} 1
 
-# One series per rank: where it runs and which layers it holds.
-vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0",
-  device_id="0", chip_index="0", core_on_chip="0", chip_coords="0,0,0", host_visible_chips="",
-  layers="0-31"} 1
+vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0",
+  node_rank="0", device_id="0", chip_index="0", core_on_chip="0", chip_coords="0,0,0",
+  host_visible_chips="", layers="0-31"} 1
+
+vllm:layer_placement_info{engine="0", rank="1", module="model", layer_subset="0-31",
+  attention_kind="full", q_heads="8-15", kv_heads="2-3", kv_replicated="False"} 1
 ```
+
+A homogeneous model has exactly one layer series per rank. A hybrid or
+multimodal model has one per distinct layer type (`count by (engine, rank)
+(vllm:layer_placement_info)` shows how many).
+
+To put chip and layers side by side, join on the rank:
+
+```promql
+vllm:layer_placement_info * on(engine, rank) group_left(device_id, chip_coords, node_rank) vllm:rank_placement_info
+```
+
+The same facts are logged: every worker writes its own record as one JSON line
+prefixed `rank_placement` as soon as it has described itself in `load_model()`,
+before KV-cache sizing and compilation, so a rank that fails later, or a pod
+that dies before its first scrape, has still left its placement in the log; the
+API server logs the aggregate once more when it publishes the gauges.
 
 ### Device identity
 
@@ -206,19 +231,28 @@ label_replace(kubernetes_io:container_accelerator_memory_used,
               "host_visible_chips", "$1", "accelerator_id", ".*-([0-9]+)$")
 ```
 
+### `vllm:rank_placement_info` labels
+
 | Label | Meaning |
 | :--- | :--- |
 | `host_visible_chips` | Host chip(s) the worker process is pinned to (`TPU_VISIBLE_CHIPS`); one chip per worker under multi-process DP (`0`…`7` on an 8-chip host), empty when the whole host is visible. The physical identity of the chip, independent of per-engine renumbering. |
 | `device_id`, `chip_coords`, `core_on_chip`, `chip_index` | The logical TPU device the rank is pinned to in the engine's slice numbering, its ICI coordinates, and which TensorCore of which physical chip that is. On TPU v7x two ranks share a `chip_index`. |
 | `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
 | `node_rank` | Host of the engine's slice this rank runs on (`--nnodes` multi-host); `0` on single-host engines. |
-| `layers` | Transformer layers held by this pipeline stage (inclusive range, from the stage's own layer bounds). |
+| `layers` | Transformer layers held by this pipeline stage (inclusive range, from the stage's own layer bounds). Authoritative for what a stage holds; `layer_subset` below partitions only the layers that contain a described module. |
 
-The same facts are logged: every worker writes its own record as one JSON line
-prefixed `rank_placement` as soon as it has described itself in `load_model()`,
-before KV-cache sizing and compilation, so a rank that fails later, or a pod
-that dies before its first scrape, has still left its placement in the log; the
-API server logs the aggregate once more when it publishes the gauges.
+### `vllm:layer_placement_info` labels
+
+Ranges are the sizes the built modules actually hold, i.e. padded sizes when the
+platform pads heads or intermediate dimensions.
+
+| Label | Meaning |
+| :--- | :--- |
+| `module`, `layer_subset` | The root module (`model`, `language_model`, `visual`, ...) and the subset of its layers whose sharding this series describes, e.g. `0-27` or `1,3,5-7`. Layers with identical sharding are merged, so homogeneous models have one series per rank; a vision tower never merges with the language model. |
+| `attention_kind` | `full` for softmax attention with a KV cache (the only kind described so far); empty for a group without attention. |
+| `q_heads`, `kv_heads` | Attention heads this tensor-parallel rank computes (inclusive ranges, from `QKVParallelLinear`). `kv_replicated="True"` means `num_kv_heads < tp_size` and the KV head is held by several TP ranks; MLA models (DeepSeek, Kimi) always report their one latent KV head this way. |
 
 Set `VLLM_TPU_EMIT_PLACEMENT=0` to disable. `vllm:parallel_config_info` is
-skipped automatically on vLLM versions that publish it themselves.
+skipped automatically on vLLM versions that publish it themselves. With
+`--api-server-count > 1` every API-server process publishes the same values;
+the multiprocess registry collapses them into one series per label set.
