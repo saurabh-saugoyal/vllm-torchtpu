@@ -13,7 +13,7 @@
 # limitations under the License.
 """Static, boot-time observability for the TPU backend.
 
-``placement_types`` holds the records, ``placement_emitter`` publishes them
-from the API server and ``placement_hook`` schedules that in the server's
-lifespan startup.
+``placement_types`` holds the records and metric label sets,
+``placement_emitter`` publishes them from the API server and
+``placement_hook`` schedules that in the server's lifespan startup.
 """

@@ -71,10 +71,10 @@ def wrap_build_app(build_app: Callable[..., FastAPI]) -> Callable[..., FastAPI]:
 def install_lifespan_hook(app: FastAPI) -> None:
     """Publish at startup, then enter vLLM's own lifespan unchanged.
 
-    ``init_app_state`` populates ``app.state.vllm_config`` between
-    ``build_app`` and the server start. Installing twice on one app is a
-    no-op, so two wrapped ``build_app`` bindings on one call path still
-    publish once.
+    ``init_app_state`` populates ``app.state.engine_client`` and
+    ``app.state.vllm_config`` between ``build_app`` and the server start.
+    Installing twice on one app is a no-op, so two wrapped ``build_app``
+    bindings on one call path still publish once.
     """
     inner = app.router.lifespan_context
     if getattr(inner, _HOOK_MARK, False):
@@ -82,7 +82,7 @@ def install_lifespan_hook(app: FastAPI) -> None:
 
     @contextlib.asynccontextmanager
     async def lifespan_with_placement(app_: FastAPI):
-        publish_placement(app_.state.vllm_config)
+        publish_placement(app_.state.engine_client, app_.state.vllm_config)
         async with inner(app_):
             yield
 

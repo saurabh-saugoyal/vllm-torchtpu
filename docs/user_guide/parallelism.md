@@ -145,3 +145,27 @@ Sizing:
 
 - `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the prefills in a step need more context tokens than this, the runner runs the step as several forwards. Must be at least `--max-model-len`. A prefill forward allocates a temporary workspace of this many tokens, reused across layers: about 0.6 GB for the MLA latents and 0.27 GB for the indexer K at the default. KV cache sizing does not reserve it yet, so leave room for it in `--gpu-memory-utilization`.
 - `TPU_PCP_KV_CHUNK_TOKENS` (default `65536`): context tokens moved by each all-gather.
+
+---
+
+## 6. Observability: how the engine is parallelised
+
+Once the model is loaded and before the server accepts requests, `vllm-torchtpu`
+publishes a static Prometheus info gauge (value `1`, the same idiom as vLLM's
+`vllm:cache_config_info`) on the regular `/metrics` endpoint. It is set once
+and never changes for the life of the process, so a scraper keeps it for as
+long as its retention allows, which makes it usable for post-mortem analysis
+of a deployment that no longer exists.
+
+```text
+# One series per engine (data-parallel rank).
+vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
+  data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
+  decode_context_parallel_size="1", world_size="4", nnodes="1"} 1
+```
+
+The same payload is also written once to the server log as a single JSON line
+prefixed `rank_placement`, for installations without a metrics scraper.
+
+Set `VLLM_TPU_EMIT_PLACEMENT=0` to disable. `vllm:parallel_config_info` is
+skipped automatically on vLLM versions that publish it themselves.
