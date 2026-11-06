@@ -53,8 +53,10 @@ _gauges: dict[str, Gauge] = {}
 
 
 def parallel_summary(
-    parallel_config: ParallelConfig, placements: Sequence[RankPlacement]
+    vllm_config: VllmConfig, placements: Sequence[RankPlacement]
 ) -> ParallelSummary:
+    parallel_config = vllm_config.parallel_config
+    kv_transfer = vllm_config.kv_transfer_config
     device = next((p.device for p in placements if p.device.device_kind), None)
     return ParallelSummary(
         tensor_parallel_size=parallel_config.tensor_parallel_size,
@@ -65,6 +67,7 @@ def parallel_summary(
         decode_context_parallel_size=parallel_config.decode_context_parallel_size,
         world_size=parallel_config.world_size,
         nnodes=parallel_config.nnodes,
+        kv_role=kv_transfer.kv_role if kv_transfer else None,
         device_kind=device.device_kind if device else None,
         visible_chips=device.visible_chips if device else None,
         cores_per_chip=device.cores_per_chip if device else None,
@@ -262,7 +265,7 @@ async def publish_placement(
             await collect_rank_placements(engine_client),
             key=lambda p: (p.dp_rank, p.rank),
         )
-        summary = parallel_summary(vllm_config.parallel_config, placements)
+        summary = parallel_summary(vllm_config, placements)
         emit_prometheus(summary, placements)
         emit_log(summary, placements)
         logger.info(
