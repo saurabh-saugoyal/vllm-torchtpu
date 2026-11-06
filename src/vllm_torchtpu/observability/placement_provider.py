@@ -14,20 +14,27 @@
 """Worker-side provider: describe the calling rank's placement.
 
 Runs once in each worker after the model is loaded. Reads vLLM's parallel
-groups, the pipeline stage's layer bounds and the device this process is
-pinned to. Nothing is computed from model names or config strings.
+groups, the device this process is pinned to, and the attention layers' own
+per-rank head counts. Nothing is computed from model names or config strings.
 """
 
 from __future__ import annotations
 
 import os
+from collections import defaultdict
 
 import torch
 from vllm.distributed import parallel_state
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.observability.placement_types import (
+    AttentionSharding,
     DeviceIdentity,
+    LayerGroup,
     Range,
     RankPlacement,
 )
@@ -76,6 +83,7 @@ def _describe(
         node_rank=node_rank,
         device=describe_device(),
         layers=_pipeline_layer_range(model),
+        layer_groups=describe_layer_groups(model),
     )
 
 
@@ -128,3 +136,107 @@ def _pipeline_layer_range(model: torch.nn.Module) -> Range | None:
         if isinstance(start, int) and isinstance(end, int):
             return (start, end)
     return None
+
+
+def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
+    """Layers grouped by (root module, sharding).
+
+    A layer is identified by its root module (the first name component, so a
+    vision tower, a draft model and the language model never merge) and its
+    index from vLLM's ``extract_layer_index``. Layers with equal attention
+    sharding collapse into one group, so a homogeneous model yields one
+    group and a hybrid model one per layer type.
+    """
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    modules = dict(model.named_modules())
+    per_layer: dict[tuple[str, int | None], dict[str, object]] = defaultdict(dict)
+    for name, module in modules.items():
+        kind, sharding = _describe_module(name, module, modules, tp_rank)
+        if kind is None:
+            continue
+        key = (name.split(".", 1)[0], _layer_index(name))
+        per_layer[key].setdefault(kind, sharding)
+
+    groups: dict[tuple, LayerGroup] = {}
+    for (root, index), parts in sorted(
+        per_layer.items(), key=lambda kv: (kv[0][0], kv[0][1] is None, kv[0][1] or 0)
+    ):
+        candidate = LayerGroup(
+            root=root,
+            layers=() if index is None else (index,),
+            attn=parts.get("attn"),  # type: ignore[arg-type]
+        )
+        key = candidate.sharding_key()
+        if key in groups:
+            groups[key] = LayerGroup(
+                root,
+                groups[key].layers + candidate.layers,
+                candidate.attn,
+            )
+        else:
+            groups[key] = candidate
+    return tuple(groups.values())
+
+
+def _layer_index(module_name: str) -> int | None:
+    try:
+        return extract_layer_index(module_name)
+    except ValueError:
+        return None
+
+
+def _describe_module(
+    name: str,
+    module: torch.nn.Module,
+    modules: dict[str, torch.nn.Module],
+    tp_rank: int,
+):
+    if isinstance(module, MambaBase):
+        # Linear attention / SSM: no heads to shard; its state is described
+        # separately.
+        return None, None
+    if isinstance(module, AttentionLayerBase):
+        return "attn", _attention_sharding(name, module, modules, tp_rank)
+    return None, None
+
+
+def _attention_sharding(
+    name: str,
+    layer: AttentionLayerBase,
+    modules: dict[str, torch.nn.Module],
+    tp_rank: int,
+) -> AttentionSharding:
+    """``Attention`` and ``MLAAttention`` carry per-rank head counts, so GQA,
+    MQA and MLA are described alike. Totals come from the sibling
+    ``QKVParallelLinear`` when present (GQA).
+    """
+    num_heads = int(layer.num_heads)
+    num_kv_heads = int(layer.num_kv_heads)
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    owner_name = name.rsplit(".", 1)[0]
+    qkv = next(
+        (
+            m
+            for n, m in modules.items()
+            if n.startswith(owner_name + ".") and isinstance(m, QKVParallelLinear)
+        ),
+        None,
+    )
+    if qkv is not None:
+        total_q, total_kv = int(qkv.total_num_heads), int(qkv.total_num_kv_heads)
+        replicas = int(qkv.num_kv_head_replicas)
+    else:
+        total_q, total_kv, replicas = num_heads * tp_size, num_kv_heads * tp_size, 1
+    kv_heads: Range = (
+        (tp_rank // replicas, tp_rank // replicas + 1)
+        if replicas > 1
+        else (tp_rank * num_kv_heads, (tp_rank + 1) * num_kv_heads)
+    )
+    return AttentionSharding(
+        kind="full",
+        q_heads=(tp_rank * num_heads, (tp_rank + 1) * num_heads),
+        kv_heads=kv_heads,
+        kv_replicated=replicas > 1,
+        total_q_heads=total_q,
+        total_kv_heads=total_kv,
+    )

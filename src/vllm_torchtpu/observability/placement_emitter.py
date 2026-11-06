@@ -13,10 +13,12 @@
 # limitations under the License.
 """API-server-side emitter: publish rank placements as Prometheus info gauges.
 
-Two gauges, value ``1`` with the facts in the labels (the
-``vllm:cache_config_info`` idiom): ``vllm:parallel_config_info`` once per
-engine and ``vllm:rank_placement_info`` once per rank. The same payload goes
-to the log once as a ``rank_placement`` JSON line.
+Three gauges, value ``1`` with the facts in the labels (the
+``vllm:cache_config_info`` idiom), one unit of cardinality each:
+``vllm:parallel_config_info`` per engine, ``vllm:rank_placement_info`` per
+rank and ``vllm:layer_placement_info`` per rank and group of identically
+sharded layers. The same payload goes to the log once as a
+``rank_placement`` JSON line.
 """
 
 from __future__ import annotations
@@ -31,9 +33,10 @@ from vllm.config import ParallelConfig
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.observability.placement_types import (
+    LAYER_LABELS,
     PARALLEL_CONFIG_LABELS,
-    PLACEMENT_LABELS,
-    DeviceIdentity,
+    RANK_LABELS,
+    LayerGroup,
     ParallelSummary,
     Range,
     RankPlacement,
@@ -47,7 +50,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PARALLEL_CONFIG_METRIC = "vllm:parallel_config_info"
-PLACEMENT_METRIC = "vllm:rank_placement_info"
+RANK_METRIC = "vllm:rank_placement_info"
+LAYER_METRIC = "vllm:layer_placement_info"
 
 _gauges: dict[str, Gauge] = {}
 
@@ -97,7 +101,8 @@ def _label(value: object) -> str:
     return "" if value is None else str(value)
 
 
-def placement_labels(placement: RankPlacement) -> dict[str, str]:
+def rank_labels(placement: RankPlacement) -> dict[str, str]:
+    """Per-process facts: coordinates, device, pipeline range. One row per rank."""
     device = placement.device
     return {
         "engine": str(placement.dp_rank),
@@ -115,6 +120,21 @@ def placement_labels(placement: RankPlacement) -> dict[str, str]:
         else "",
         "host_visible_chips": format_ids(device.host_visible_chips),
         "layers": format_range(placement.layers),
+    }
+
+
+def layer_labels(placement: RankPlacement, group: LayerGroup) -> dict[str, str]:
+    """Per-layer-group facts: which slice of these layers the rank holds."""
+    attn = group.attn
+    return {
+        "engine": str(placement.dp_rank),
+        "rank": str(placement.rank),
+        "module": group.root,
+        "layer_subset": format_ids(group.layers),
+        "attention_kind": attn.kind if attn else "",
+        "q_heads": format_range(attn.q_heads) if attn else "",
+        "kv_heads": format_range(attn.kv_heads) if attn else "",
+        "kv_replicated": _label(attn.kv_replicated) if attn else "",
     }
 
 
@@ -152,13 +172,21 @@ def emit_prometheus(
         )
         for engine in engines:
             gauge.labels(**parallel_config_labels(summary, engine)).set(1)
-    gauge = _gauge(
-        PLACEMENT_METRIC,
-        "TPU device each rank runs on and the layers it holds; one series per rank",
-        label_names(PLACEMENT_LABELS),
+    ranks = _gauge(
+        RANK_METRIC,
+        "Parallel-group position and TPU device of each rank; one series per rank",
+        label_names(RANK_LABELS),
+    )
+    layers = _gauge(
+        LAYER_METRIC,
+        "Slice of each group of identically sharded layers a rank holds; "
+        "one series per rank and layer group",
+        label_names(LAYER_LABELS),
     )
     for placement in placements:
-        gauge.labels(**placement_labels(placement)).set(1)
+        ranks.labels(**rank_labels(placement)).set(1)
+        for group in placement.layer_groups:
+            layers.labels(**layer_labels(placement, group)).set(1)
 
 
 def emit_log(summary: ParallelSummary, placements: Sequence[RankPlacement]) -> None:
@@ -192,9 +220,22 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
     """collective_rpc may hand back the dataclass or its serialised dict."""
     if isinstance(row, RankPlacement):
         return row
+    from vllm_torchtpu.observability.placement_types import (
+        AttentionSharding,
+        DeviceIdentity,
+    )
+
+    def group(g: dict) -> LayerGroup:
+        return LayerGroup(
+            root=g["root"],
+            layers=tuple(g["layers"]),
+            attn=AttentionSharding(**g["attn"]) if g["attn"] else None,
+        )
+
     return RankPlacement(
-        **{k: v for k, v in row.items() if k != "device"},
+        **{k: v for k, v in row.items() if k not in ("device", "layer_groups")},
         device=DeviceIdentity(**row["device"]),
+        layer_groups=tuple(group(g) for g in row["layer_groups"]),
     )
 
 
@@ -212,10 +253,11 @@ async def publish_placement(
         emit_prometheus(summary, placements)
         emit_log(summary, placements)
         logger.info(
-            "Published TPU placement for %d rank(s) as %s and %s.",
+            "Published TPU placement for %d rank(s) as %s, %s and %s.",
             len(placements),
             PARALLEL_CONFIG_METRIC,
-            PLACEMENT_METRIC,
+            RANK_METRIC,
+            LAYER_METRIC,
         )
     except Exception as error:  # noqa: BLE001 - see docstring
         logger.warning("Could not publish TPU placement: %s", error)

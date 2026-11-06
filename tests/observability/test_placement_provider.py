@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Provider: rank coordinates and device identity."""
+"""Provider: rank coordinates, device identity and per-layer sharding."""
 
 from __future__ import annotations
 
@@ -35,6 +35,11 @@ def quiet_device(monkeypatch):
 
 def describe(model, rank=0, dp_rank=0, node_rank=0):
     return describe_rank_placement(rank, dp_rank, node_rank, model)
+
+
+def only_group(placement):
+    assert len(placement.layer_groups) == 1, placement.layer_groups
+    return placement.layer_groups[0]
 
 
 # ---------------------------------------------------------------- coordinates
@@ -66,7 +71,7 @@ def test_pipeline_stage_layers_from_model(monkeypatch, quiet_device):
 def test_describe_never_raises(monkeypatch, quiet_device):
     monkeypatch.setattr(placement_provider, "parallel_state", SimpleNamespace())
     p = describe(torch.nn.Module(), rank=7)
-    assert p.rank == 7 and p.error and p.device == DeviceIdentity()
+    assert p.rank == 7 and p.error and p.layer_groups == ()
 
 
 def test_device_identity(monkeypatch):
@@ -101,3 +106,60 @@ def test_device_identity(monkeypatch):
         cores_per_chip=2,
         host_visible_chips=(4, 5, 6, 7),
     )
+
+
+# ------------------------------------------------------------------- sharding
+
+
+@pytest.mark.parametrize(
+    "tp_rank,q_heads,kv_heads",
+    [(0, (0, 8), (0, 2)), (1, (8, 16), (2, 4)), (3, (24, 32), (6, 8))],
+)
+def test_dense_tp4(monkeypatch, quiet_device, tp_rank, q_heads, kv_heads):
+    fakes.fake_parallel_state(monkeypatch, tp_rank=tp_rank, tp_size=4)
+    group = only_group(describe(fakes.dense_model(tp_size=4), rank=tp_rank))
+    assert group.root == "model" and group.layers == (0, 1, 2, 3)
+    assert group.attn.kind == "full"
+    assert (group.attn.q_heads, group.attn.kv_heads) == (q_heads, kv_heads)
+    assert not group.attn.kv_replicated
+
+
+@pytest.mark.parametrize(
+    "rank,kv", [(0, (0, 1)), (3, (0, 1)), (4, (1, 2)), (7, (1, 2))]
+)
+def test_kv_heads_replicated_when_fewer_than_tp(monkeypatch, quiet_device, rank, kv):
+    fakes.fake_parallel_state(monkeypatch, tp_rank=rank, tp_size=8)
+    attn = only_group(
+        describe(fakes.dense_model(8, heads=32, kv_heads=2), rank=rank)
+    ).attn
+    assert attn.kv_heads == kv and attn.kv_replicated
+    assert attn.q_heads == (rank * 4, (rank + 1) * 4)
+
+
+def test_mla_attention_without_qkv_proj(monkeypatch, quiet_device):
+    """MLA has no QKVParallelLinear: totals derive from per-rank counts."""
+    fakes.fake_parallel_state(monkeypatch, tp_rank=2, tp_size=4)
+    layer = torch.nn.Module()
+    layer.self_attn = torch.nn.Module()
+    layer.self_attn.mla_attn = fakes.attention(num_heads=4, num_kv_heads=1)
+    attn = only_group(describe(fakes.FakeModel([layer]), rank=2)).attn
+    assert attn.q_heads == (8, 12) and attn.kv_heads == (2, 3)
+    assert attn.total_q_heads == 16 and not attn.kv_replicated
+
+
+def test_linear_attention_layers_do_not_fail_the_description(monkeypatch, quiet_device):
+    """Qwen3.5 / Qwen3-Next: GDN layers are ``MambaBase`` without head counts;
+    they form their own group, described by a later change."""
+    fakes.fake_parallel_state(monkeypatch, tp_rank=1, tp_size=4)
+    layers = []
+    for i in range(4):
+        layer = torch.nn.Module()
+        if i == 3:
+            layer.self_attn = fakes.AttentionBlock(16, 4, tp_size=4)
+        else:
+            layer.linear_attn = fakes.GatedDeltaNet(num_v_heads=32, tp_size=4)
+        layers.append(layer)
+    p = describe(fakes.FakeModel(layers), rank=1)
+    assert p.error is None
+    assert [g.layers for g in p.layer_groups] == [(0, 1, 2), (3,)]
+    assert p.layer_groups[0].attn is None and p.layer_groups[1].attn.q_heads == (4, 8)

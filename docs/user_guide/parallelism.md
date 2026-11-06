@@ -124,24 +124,44 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
 ## 6. Observability: which rank holds what
 
 Once the model is loaded and before the server accepts requests, `vllm-torchtpu`
-publishes two static Prometheus info gauges (value `1`, the same idiom as vLLM's
-`vllm:cache_config_info`) on the regular `/metrics` endpoint. They are set once
-and never change for the life of the process, so a scraper keeps them for as
-long as its retention allows, which makes them usable for post-mortem analysis
-of a deployment that no longer exists.
+publishes three static Prometheus info gauges (value `1`, the same idiom as
+vLLM's `vllm:cache_config_info`) on the regular `/metrics` endpoint. They are
+set once and never change for the life of the process, so a scraper keeps them
+for as long as its retention allows, which makes them usable for post-mortem
+analysis of a deployment that no longer exists. Each gauge has one unit of
+cardinality; an empty label value means *not applicable to this row*, never
+unknown.
+
+| Gauge | One series per | Key |
+| :--- | :--- | :--- |
+| `vllm:parallel_config_info` | engine (data-parallel rank) | `engine` |
+| `vllm:rank_placement_info` | worker rank | `engine, rank` |
+| `vllm:layer_placement_info` | rank × group of identically sharded layers | `engine, rank, module, layer_subset` |
 
 ```text
-# One series per engine (data-parallel rank).
 vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
   data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
   decode_context_parallel_size="1", world_size="4", nnodes="1", device_kind="TPU v6e",
   visible_chips="4", cores_per_chip="1"} 1
 
-# One series per rank: where it runs and which layers it holds.
-vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0",
-  device_id="1", chip_index="1", core_on_chip="0", chip_coords="1,0,0", host_visible_chips="",
-  layers="0-31"} 1
+vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0",
+  node_rank="0", device_id="1", chip_index="1", core_on_chip="0", chip_coords="1,0,0",
+  host_visible_chips="", layers="0-31"} 1
+
+vllm:layer_placement_info{engine="0", rank="1", module="model", layer_subset="0-31",
+  attention_kind="full", q_heads="8-15", kv_heads="2-3", kv_replicated="False"} 1
 ```
+
+A homogeneous model has exactly one layer series per rank. A hybrid or
+multimodal model has one per distinct layer type (`count by (engine, rank)
+(vllm:layer_placement_info)` shows how many). To put chip and layers side by
+side, join on the rank:
+
+```promql
+vllm:layer_placement_info * on(engine, rank) group_left(device_id, chip_coords, node_rank) vllm:rank_placement_info
+```
+
+`vllm:rank_placement_info` labels:
 
 | Label | Meaning |
 | :--- | :--- |
@@ -150,6 +170,14 @@ vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_ran
 | `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
 | `node_rank` | Host of the engine's slice this rank runs on (`--nnodes` multi-host); `0` on single-host engines. |
 | `layers` | Transformer layers held by this pipeline stage (inclusive range). |
+
+`vllm:layer_placement_info` labels:
+
+| Label | Meaning |
+| :--- | :--- |
+| `module`, `layer_subset` | The root module (`model`, `visual`, `draft`, ...) and the subset of its layers whose sharding this series describes, e.g. `0-27` or `1,3,5-7`. Layers with identical attention/MLP sharding are merged, so homogeneous models have one series per rank; a vision tower or draft model never merges with the language model. |
+| `attention_kind` | `full` for softmax attention with a KV cache (the only kind described so far); empty for a group without attention. |
+| `q_heads`, `kv_heads` | Attention heads this tensor-parallel rank computes (inclusive ranges, from `QKVParallelLinear`). `kv_replicated="True"` means `num_kv_heads < tp_size` and the single KV head is shared by several ranks. |
 
 The same payload is also written once to the server log as a single JSON line
 prefixed `rank_placement`, for installations without a metrics scraper.
