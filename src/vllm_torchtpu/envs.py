@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
+    VLLM_TPU_EMIT_PLACEMENT: bool = True
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
@@ -770,6 +771,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the in-tree experimental RPA kernel modules; see
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
+    # Log the engine's parallel configuration once at startup, before the
+    # server accepts requests. See observability/placement_hook.py.
+    "VLLM_TPU_EMIT_PLACEMENT": lambda: bool(
+        int(os.getenv("VLLM_TPU_EMIT_PLACEMENT") or "1")
+    ),
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
