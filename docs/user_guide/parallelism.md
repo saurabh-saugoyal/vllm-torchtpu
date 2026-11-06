@@ -144,7 +144,7 @@ vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_paralle
 vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0",
   device_id="1", chip_index="1", core_on_chip="0", chip_coords="1,0,0", host_visible_chips="",
   layers="0-31", module="model", layer_subset="0-31", q_heads="8-15", kv_heads="2-3", kv_replicated="False",
-  gqa_padded="False", mlp_intermediate="3584-7167"} 1
+  gqa_padded="False", linear_attention="", linear_state="", mlp_intermediate="3584-7167"} 1
 ```
 
 | Label | Meaning |
@@ -156,6 +156,7 @@ vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank
 | `layers` | Transformer layers held by this pipeline stage (inclusive range). |
 | `module`, `layer_subset` | The root module (`model`, `visual`, `draft`, ...) and the subset of its layers whose sharding this series describes, e.g. `0-27` or `1,3,5-7`. Layers with identical attention/MLP sharding are merged, so homogeneous models have one series per rank; a vision tower or draft model never merges with the language model. |
 | `q_heads`, `kv_heads` | Attention heads this tensor-parallel rank computes (inclusive ranges, from `QKVParallelLinear`). `kv_replicated="True"` means `num_kv_heads < tp_size` and the single KV head is shared by several ranks. `gqa_padded="True"` means the Q-head count was zero-padded to divide by TP, so the range is in padded head indices. |
+| `linear_attention`, `linear_state` | For linear-attention / state-space layers (Gated DeltaNet in Qwen3.5 and Qwen3-Next, Kimi Delta Attention, Mamba) there are no KV heads; instead the rank holds a slice of the layer's recurrent state. `linear_attention` is vLLM's `mamba_type` (`GDN`, `KDA`, `MAMBA2`, ...) and `linear_state` the per-rank state shapes from `get_state_shape()`, e.g. `256x4|8x128x128` (conv state, SSM state). In a hybrid model these layers form their own `layer_subset`, separate from the full-attention layers. |
 | `mlp_intermediate` | Columns of the dense MLP intermediate dimension this rank holds (its `gate_proj`/`up_proj` rows and `down_proj` columns). |
 
 The same payload is also written once to the server log as a single JSON line

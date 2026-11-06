@@ -102,6 +102,7 @@ def placement_labels(
 ) -> dict[str, str]:
     device = placement.device
     attn = group.attn if group else None
+    linear = group.linear_attn if group else None
     mlp = group.mlp if group else None
     return {
         "engine": str(placement.dp_rank),
@@ -125,6 +126,10 @@ def placement_labels(
         "kv_heads": format_range(attn.kv_heads) if attn else "",
         "kv_replicated": _label(attn.kv_replicated) if attn else "",
         "gqa_padded": _label(attn.gqa_padded) if attn else "",
+        "linear_attention": linear.kind if linear else "",
+        "linear_state": "|".join("x".join(map(str, s)) for s in linear.state_shapes)
+        if linear
+        else "",
         "mlp_intermediate": format_range(mlp.intermediate) if mlp else "",
     }
 
@@ -214,6 +219,7 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
     from vllm_torchtpu.observability.placement_types import (
         AttentionSharding,
         DeviceIdentity,
+        LinearAttentionSharding,
         MlpSharding,
     )
 
@@ -222,6 +228,9 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
             root=g["root"],
             layers=tuple(g["layers"]),
             attn=AttentionSharding(**g["attn"]) if g["attn"] else None,
+            linear_attn=LinearAttentionSharding(**g["linear_attn"])
+            if g["linear_attn"]
+            else None,
             mlp=MlpSharding(**g["mlp"]) if g["mlp"] else None,
         )
 

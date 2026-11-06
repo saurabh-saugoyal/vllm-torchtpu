@@ -181,23 +181,30 @@ def test_hybrid_layers_group_by_sharding(monkeypatch, quiet_device):
     assert groups[2].attn and groups[2].mlp is None
 
 
-def test_linear_attention_layers_do_not_fail_the_description(monkeypatch, quiet_device):
-    """Qwen3.5 / Qwen3-Next: GDN layers are ``MambaBase`` without head counts."""
+def test_linear_attention_layers_interleaved_with_full_attention(
+    monkeypatch, quiet_device
+):
+    """Qwen3.5 / Qwen3-Next: three GDN layers then one full-attention layer,
+    all with the same dense MLP -> two groups, by attention kind."""
     fakes.fake_parallel_state(monkeypatch, tp_rank=1, tp_size=4)
     layers = []
-    for i in range(4):
+    for i in range(8):
         layer = torch.nn.Module()
-        if i == 3:
+        if i % 4 == 3:
             layer.self_attn = fakes.AttentionBlock(16, 4, tp_size=4)
         else:
             layer.linear_attn = fakes.GatedDeltaNet(num_v_heads=32, tp_size=4)
         layer.mlp = torch.nn.Module()
         layer.mlp.down_proj = fakes.down_proj(8192, 4)
         layers.append(layer)
-    p = describe(fakes.FakeModel(layers), rank=1)
-    assert p.error is None
-    assert [g.layers for g in p.layer_groups] == [(0, 1, 2), (3,)]
-    assert p.layer_groups[0].attn is None and p.layer_groups[1].attn.q_heads == (4, 8)
+    groups = describe(fakes.FakeModel(layers), rank=1).layer_groups
+    assert [g.layers for g in groups] == [(0, 1, 2, 4, 5, 6), (3, 7)]
+    linear, full = groups
+    assert linear.attn is None and full.linear_attn is None
+    assert linear.linear_attn.kind == "GDN" and not linear.linear_attn.tp_replicated
+    assert linear.linear_attn.state_shapes == ((128, 4), (8, 128, 128))
+    assert full.attn.q_heads == (4, 8)
+    assert linear.mlp == full.mlp
 
 
 def test_vision_tower_and_draft_do_not_merge_with_language_model(

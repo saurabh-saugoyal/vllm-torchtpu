@@ -79,7 +79,9 @@ class GatedDeltaNet(torch.nn.Module, MambaBase):
 
     @property
     def mamba_type(self):
-        return SimpleNamespace(name="GDN")  # the backend enum member, as read
+        return SimpleNamespace(
+            name="GDN"
+        )  # the backend enum member, as the provider reads it
 
     def get_state_dtype(self):
         return (torch.bfloat16, torch.float32)

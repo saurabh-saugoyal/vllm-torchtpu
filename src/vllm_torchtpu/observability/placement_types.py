@@ -57,6 +57,17 @@ class AttentionSharding:
 
 
 @dataclass(frozen=True)
+class LinearAttentionSharding:
+    """Recurrent state one rank holds in a linear-attention / SSM layer
+    (Gated DeltaNet, Kimi Delta Attention, Mamba): ``kind`` is vLLM's
+    ``mamba_type`` and ``state_shapes`` its per-rank ``get_state_shape()``."""
+
+    kind: str
+    state_shapes: tuple[tuple[int, ...], ...]
+    tp_replicated: bool
+
+
+@dataclass(frozen=True)
 class MlpSharding:
     """Columns of the dense MLP intermediate dim one rank holds."""
 
@@ -71,10 +82,11 @@ class LayerGroup:
     root: str
     layers: tuple[int, ...]
     attn: AttentionSharding | None = None
+    linear_attn: LinearAttentionSharding | None = None
     mlp: MlpSharding | None = None
 
     def sharding_key(self) -> tuple:
-        return (self.root, self.attn, self.mlp)
+        return (self.root, self.attn, self.linear_attn, self.mlp)
 
 
 @dataclass(frozen=True)
@@ -177,6 +189,12 @@ PLACEMENT_LABELS: tuple[LabelSpec, ...] = (
         "kv_replicated", "[bool] num_kv_heads < TP: a KV head is shared by ranks"
     ),
     LabelSpec("gqa_padded", "[bool] Q heads zero-padded to divide by TP"),
+    LabelSpec(
+        "linear_attention", "[text] GDN | KDA | MAMBA2 ... for linear-attention layers"
+    ),
+    LabelSpec(
+        "linear_state", "[shapes] per-rank recurrent state, e.g. '4x128x128|4x4x128'"
+    ),
     LabelSpec("mlp_intermediate", "[range] dense MLP intermediate slab on this rank"),
 )
 

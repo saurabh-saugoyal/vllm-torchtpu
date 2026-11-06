@@ -36,6 +36,7 @@ from vllm_torchtpu.observability.placement_types import (
     AttentionSharding,
     DeviceIdentity,
     LayerGroup,
+    LinearAttentionSharding,
     MlpSharding,
     Range,
     RankPlacement,
@@ -167,6 +168,7 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
             root=root,
             layers=() if index is None else (index,),
             attn=parts.get("attn"),  # type: ignore[arg-type]
+            linear_attn=parts.get("linear_attn"),  # type: ignore[arg-type]
             mlp=parts.get("mlp"),  # type: ignore[arg-type]
         )
         key = candidate.sharding_key()
@@ -175,6 +177,7 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
                 root,
                 groups[key].layers + candidate.layers,
                 candidate.attn,
+                candidate.linear_attn,
                 candidate.mlp,
             )
         else:
@@ -196,9 +199,13 @@ def _describe_module(
     tp_rank: int,
 ):
     if isinstance(module, MambaBase):
-        # Linear attention / SSM: no heads to shard; its state is described
-        # separately.
-        return None, None
+        return "linear_attn", LinearAttentionSharding(
+            kind=module.mamba_type.name,
+            state_shapes=tuple(
+                tuple(int(d) for d in s) for s in module.get_state_shape()
+            ),
+            tp_replicated=bool(module.is_kv_cache_tp_replicated),
+        )
     if isinstance(module, AttentionLayerBase):
         return "attn", _attention_sharding(name, module, modules, tp_rank)
     if isinstance(module, RowParallelLinear) and name.rsplit(".", 1)[-1] in (
@@ -224,7 +231,8 @@ def _attention_sharding(
     tp_rank: int,
 ) -> AttentionSharding:
     """``Attention`` and ``MLAAttention`` carry per-rank head counts, so GQA,
-    MQA, MLA and vision attention are described alike. Totals and the Qwen2
+    MQA, MLA and vision attention are described alike (linear-attention
+    layers are ``MambaBase`` and dispatched before this). Totals and the Qwen2
     padding marker come from the sibling ``QKVParallelLinear`` / owning
     attention module when present (GQA); MLA has one latent KV head per rank.
     """

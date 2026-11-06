@@ -31,6 +31,7 @@ from vllm_torchtpu.observability.placement_types import (
     AttentionSharding,
     DeviceIdentity,
     LayerGroup,
+    LinearAttentionSharding,
     MlpSharding,
     RankPlacement,
     label_names,
@@ -141,6 +142,8 @@ def test_placement_labels_exact():
         "kv_heads": "2-3",
         "kv_replicated": "False",
         "gqa_padded": "False",
+        "linear_attention": "",
+        "linear_state": "",
         "mlp_intermediate": "3584-7167",
     }
     assert list(labels) == label_names(PLACEMENT_LABELS)
@@ -162,7 +165,13 @@ def test_one_series_per_layer_group():
         LayerGroup(
             "model", (0, 2), attn=AttentionSharding((8, 16), (0, 1), True, 16, 2)
         ),
-        LayerGroup("model", (1, 3)),
+        LayerGroup(
+            "model",
+            (1, 3),
+            linear_attn=LinearAttentionSharding(
+                "GDN", ((128, 4), (8, 128, 128)), False
+            ),
+        ),
         LayerGroup(
             "visual", (0,), attn=AttentionSharding((0, 8), (0, 8), False, 16, 16)
         ),
@@ -174,6 +183,9 @@ def test_one_series_per_layer_group():
         ("visual", "0"),
     ]
     assert series[0]["kv_heads"] == "0" and series[1]["q_heads"] == ""
+    assert series[1]["linear_attention"] == "GDN"
+    assert series[1]["linear_state"] == "128x4|8x128x128"
+    assert series[0]["linear_attention"] == ""
 
 
 @pytest.mark.parametrize("bounds,text", [(None, ""), ((3, 4), "3"), ((8, 16), "8-15")])
