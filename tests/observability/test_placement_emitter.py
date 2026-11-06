@@ -77,6 +77,13 @@ def placement(rank, dp_rank=0, groups=None, **overrides) -> RankPlacement:
     return RankPlacement(**base)
 
 
+def vllm_config(kv_role=None, **kw):
+    kv_transfer = SimpleNamespace(kv_role=kv_role) if kv_role else None
+    return SimpleNamespace(
+        parallel_config=parallel_config(**kw), kv_transfer_config=kv_transfer
+    )
+
+
 def parallel_config(**kw):
     base = dict(
         tensor_parallel_size=4,
@@ -96,7 +103,7 @@ def parallel_config(**kw):
 
 
 def test_parallel_config_labels_exact():
-    summary = emitter.parallel_summary(parallel_config(nnodes=2), [placement(0)])
+    summary = emitter.parallel_summary(vllm_config(nnodes=2), [placement(0)])
     labels = emitter.parallel_config_labels(summary, 1)
     assert labels == {
         "engine": "1",
@@ -108,6 +115,7 @@ def test_parallel_config_labels_exact():
         "decode_context_parallel_size": "1",
         "world_size": "4",
         "nnodes": "2",
+        "kv_role": "",
         "device_kind": "TPU v6e",
         "visible_chips": "4",
         "cores_per_chip": "1",
@@ -271,8 +279,17 @@ def test_format_ids():
     )
 
 
+def test_kv_role_from_kv_transfer_config():
+    ps = [placement(0)]
+    assert emitter.parallel_summary(vllm_config(), ps).kv_role is None
+    labels = emitter.parallel_config_labels(
+        emitter.parallel_summary(vllm_config(kv_role="kv_producer"), ps), 0
+    )
+    assert labels["kv_role"] == "kv_producer"
+
+
 def test_parallel_summary_takes_hardware_from_placements():
-    s = emitter.parallel_summary(parallel_config(), [placement(0), placement(1)])
+    s = emitter.parallel_summary(vllm_config(), [placement(0), placement(1)])
     assert (s.tensor_parallel_size, s.world_size, s.nnodes) == (4, 4, 1)
     assert (s.device_kind, s.visible_chips, s.cores_per_chip) == ("TPU v6e", 4, 1)
 
@@ -320,7 +337,7 @@ def test_emit_prometheus_one_rank_row_and_one_layer_row_per_group(registry):
         placement(1, dp_rank=1, groups=hybrid),
     ]
     emitter.emit_prometheus(
-        emitter.parallel_summary(parallel_config(data_parallel_size=2), ps), ps
+        emitter.parallel_summary(vllm_config(data_parallel_size=2), ps), ps
     )
     parallel = series(registry, emitter.PARALLEL_CONFIG_METRIC)
     assert {dict(k)["engine"] for k in parallel} == {"0", "1"} and set(
@@ -343,7 +360,7 @@ def test_emit_prometheus_one_rank_row_and_one_layer_row_per_group(registry):
 
 def test_emit_prometheus_idempotent(registry):
     ps = [placement(0)]
-    summary = emitter.parallel_summary(parallel_config(), ps)
+    summary = emitter.parallel_summary(vllm_config(), ps)
     emitter.emit_prometheus(summary, ps)
     emitter.emit_prometheus(summary, ps)
     assert len(series(registry, emitter.RANK_METRIC)) == 1
@@ -353,7 +370,7 @@ def test_emit_prometheus_idempotent(registry):
 def test_parallel_config_metric_skipped_when_vllm_has_it(registry, monkeypatch):
     monkeypatch.setattr(emitter, "vllm_exports_parallel_config_info", lambda: True)
     ps = [placement(0)]
-    emitter.emit_prometheus(emitter.parallel_summary(parallel_config(), ps), ps)
+    emitter.emit_prometheus(emitter.parallel_summary(vllm_config(), ps), ps)
     assert series(registry, emitter.PARALLEL_CONFIG_METRIC) == {}
     assert len(series(registry, emitter.RANK_METRIC)) == 1
 
@@ -362,7 +379,9 @@ def test_parallel_summary_reads_vllm_parallel_config_at_the_pin():
     """Every field is read from the real ParallelConfig, so a rename at a pin
     bump fails here rather than at server startup."""
     config = ParallelConfig(tensor_parallel_size=2, pipeline_parallel_size=2)
-    summary = emitter.parallel_summary(config, []).to_dict()
+    summary = emitter.parallel_summary(
+        SimpleNamespace(parallel_config=config, kv_transfer_config=None), []
+    ).to_dict()
     names = (
         "tensor_parallel_size",
         "pipeline_parallel_size",
@@ -381,7 +400,7 @@ def test_parallel_summary_reads_vllm_parallel_config_at_the_pin():
 def test_emit_log_is_one_json_line(caplog):
     ps = [placement(0)]
     with caplog.at_level(logging.INFO, logger=emitter.logger.name):
-        emitter.emit_log(emitter.parallel_summary(parallel_config(), ps), ps)
+        emitter.emit_log(emitter.parallel_summary(vllm_config(), ps), ps)
     lines = [
         r.getMessage()
         for r in caplog.records
@@ -441,8 +460,4 @@ def test_publish_propagates_rpc_failures():
 
     client = SimpleNamespace(collective_rpc=collective_rpc)
     with pytest.raises(RuntimeError, match="engine down"):
-        asyncio.run(
-            emitter.publish_placement(
-                client, SimpleNamespace(parallel_config=parallel_config())
-            )
-        )
+        asyncio.run(emitter.publish_placement(client, vllm_config()))

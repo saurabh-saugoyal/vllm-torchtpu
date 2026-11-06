@@ -165,6 +165,7 @@ class ParallelSummary:
     decode_context_parallel_size: int
     world_size: int
     nnodes: int
+    kv_role: str | None = None
     device_kind: str | None = None
     visible_chips: int | None = None
     cores_per_chip: int | None = None
@@ -196,6 +197,9 @@ PARALLEL_CONFIG_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec("decode_context_parallel_size", "[count] ranks splitting the KV cache"),
     LabelSpec("world_size", "[count] worker processes per engine = TP x PP x PCP"),
     LabelSpec("nnodes", "[count] hosts one engine spans; 1 unless --nnodes"),
+    LabelSpec(
+        "kv_role", "[text] kv_producer | kv_consumer | kv_both under P/D; '' otherwise"
+    ),
     LabelSpec("device_kind", "[text] e.g. 'TPU v5 lite', 'TPU v6e'"),
     LabelSpec("visible_chips", "[count] chips the engine's workers can see"),
     LabelSpec("cores_per_chip", "[count] TensorCores per chip: 1 on v5e/v6e, 2 on v7x"),

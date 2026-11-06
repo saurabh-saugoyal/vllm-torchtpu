@@ -168,7 +168,7 @@ unknown.
 ```text
 vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
   data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
-  decode_context_parallel_size="1", world_size="4", nnodes="1", device_kind="TPU v6e",
+  decode_context_parallel_size="1", world_size="4", nnodes="1", kv_role="", device_kind="TPU v6e",
   visible_chips="4", cores_per_chip="1"} 1
 
 vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0",
@@ -250,6 +250,7 @@ label_replace(kubernetes_io:container_accelerator_memory_used,
 
 | Label | Meaning |
 | :--- | :--- |
+| `kv_role` | `kv_producer` (prefill pool) or `kv_consumer` (decode pool) under [disaggregated serving](disaggregated_serving.md), from `--kv-transfer-config`; empty for a regular instance. Each pool is its own server with its own `/metrics`, so this is what tells them apart. |
 | `host_visible_chips` | Host chip(s) the worker process is pinned to (`TPU_VISIBLE_CHIPS`); one chip per worker under multi-process DP (`0`…`7` on an 8-chip host), empty when the whole host is visible. The physical identity of the chip, independent of per-engine renumbering. |
 | `device_id`, `chip_coords`, `core_on_chip`, `chip_index` | The logical TPU device the rank is pinned to in the engine's slice numbering, its ICI coordinates, and which TensorCore of which physical chip that is. On TPU v7x two ranks share a `chip_index`. |
 | `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
