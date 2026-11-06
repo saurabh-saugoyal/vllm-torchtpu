@@ -14,8 +14,10 @@
 """Worker-side provider: describe the calling rank's placement.
 
 Runs once in each worker after the model is loaded. Reads vLLM's parallel
-groups, the device this process is pinned to, and the attention layers' own
-per-rank head counts. Nothing is computed from model names or config strings.
+groups, the device this process is pinned to, and the sharded layers' own
+attributes (``Attention.num_heads``, ``RowParallelLinear.input_size_per_
+partition``, the routed-experts layer's expert map). Nothing is computed from
+model names or config strings.
 """
 
 from __future__ import annotations
@@ -25,8 +27,13 @@ from collections import defaultdict
 
 import torch
 from vllm.distributed import parallel_state
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.models.utils import extract_layer_index
 
@@ -35,6 +42,9 @@ from vllm_torchtpu.observability.placement_types import (
     AttentionSharding,
     DeviceIdentity,
     LayerGroup,
+    LinearAttentionSharding,
+    MlpSharding,
+    MoeSharding,
     Range,
     RankPlacement,
 )
@@ -143,9 +153,9 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
 
     A layer is identified by its root module (the first name component, so a
     vision tower, a draft model and the language model never merge) and its
-    index from vLLM's ``extract_layer_index``. Layers with equal attention
-    sharding collapse into one group, so a homogeneous model yields one
-    group and a hybrid model one per layer type.
+    index from vLLM's ``extract_layer_index``. Layers with equal attention /
+    MLP / MoE / shared-expert sharding collapse into one group, so a
+    homogeneous model yields one group and a hybrid model one per layer type.
     """
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     modules = dict(model.named_modules())
@@ -165,6 +175,10 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
             root=root,
             layers=() if index is None else (index,),
             attn=parts.get("attn"),  # type: ignore[arg-type]
+            linear_attn=parts.get("linear_attn"),  # type: ignore[arg-type]
+            mlp=parts.get("mlp"),  # type: ignore[arg-type]
+            moe=parts.get("moe"),  # type: ignore[arg-type]
+            shared_mlp=parts.get("shared_mlp"),  # type: ignore[arg-type]
         )
         key = candidate.sharding_key()
         if key in groups:
@@ -172,10 +186,19 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
                 root,
                 groups[key].layers + candidate.layers,
                 candidate.attn,
+                candidate.linear_attn,
+                candidate.mlp,
+                candidate.moe,
+                candidate.shared_mlp,
             )
         else:
             groups[key] = candidate
     return tuple(groups.values())
+
+
+# vLLM's attribute names for the always-on expert(s) of a MoE block
+# (Qwen2-MoE / Llama 4: ``shared_expert``; DeepSeek: ``shared_experts``).
+_SHARED_EXPERT = frozenset({"shared_expert", "shared_experts"})
 
 
 def _layer_index(module_name: str) -> int | None:
@@ -192,23 +215,47 @@ def _describe_module(
     tp_rank: int,
 ):
     if isinstance(module, MambaBase):
-        # Linear attention / SSM: no heads to shard; its state is described
-        # separately.
-        return None, None
-    if isinstance(module, AttentionLayerBase):
+        return "linear_attn", LinearAttentionSharding(
+            kind=module.mamba_type.name,
+            state_shapes=tuple(
+                tuple(int(d) for d in s) for s in module.get_state_shape()
+            ),
+            tp_replicated=bool(module.is_kv_cache_tp_replicated),
+        )
+    if isinstance(module, (AttentionLayerBase, MMEncoderAttention)):
         return "attn", _attention_sharding(name, module, modules, tp_rank)
+    if isinstance(module, RoutedExperts):
+        return "moe", _moe_sharding(module)
+    if isinstance(module, RowParallelLinear) and name.rsplit(".", 1)[-1] in (
+        "down_proj",
+        "fc2",
+        "c_proj",
+        "w2",
+    ):
+        kind = "shared_mlp" if _SHARED_EXPERT.intersection(name.split(".")) else "mlp"
+        return kind, MlpSharding(
+            intermediate=(
+                tp_rank * module.input_size_per_partition,
+                (tp_rank + 1) * module.input_size_per_partition,
+            ),
+            total_intermediate=module.input_size,
+        )
     return None, None
 
 
 def _attention_sharding(
     name: str,
-    layer: AttentionLayerBase,
+    layer: AttentionLayerBase | MMEncoderAttention,
     modules: dict[str, torch.nn.Module],
     tp_rank: int,
 ) -> AttentionSharding:
-    """``Attention`` and ``MLAAttention`` carry per-rank head counts, so GQA,
-    MQA and MLA are described alike. Totals come from the sibling
-    ``QKVParallelLinear`` when present (GQA).
+    """``Attention``, ``MLAAttention`` and the multimodal encoder's
+    ``MMEncoderAttention`` all carry per-rank head counts, so GQA, MQA, MLA and
+    vision attention are described alike (linear-attention layers are
+    ``MambaBase`` and dispatched before this). Totals and KV-head replication
+    come from the sibling ``QKVParallelLinear`` when present. MLA's single
+    latent KV head is not split by TP: every rank holds it, so it is reported
+    as one replicated head.
     """
     num_heads = int(layer.num_heads)
     num_kv_heads = int(layer.num_kv_heads)
@@ -222,7 +269,9 @@ def _attention_sharding(
         ),
         None,
     )
-    if qkv is not None:
+    if isinstance(layer, MLAAttention):
+        total_q, total_kv, replicas = num_heads * tp_size, 1, tp_size
+    elif qkv is not None:
         total_q, total_kv = int(qkv.total_num_heads), int(qkv.total_num_kv_heads)
         replicas = int(qkv.num_kv_head_replicas)
     else:
@@ -239,4 +288,22 @@ def _attention_sharding(
         kv_replicated=replicas > 1,
         total_q_heads=total_q,
         total_kv_heads=total_kv,
+    )
+
+
+def _moe_sharding(layer: RoutedExperts) -> MoeSharding:
+    """``expert_map[global_id]`` is the local slot or ``-1``; it is ``None``
+    when expert parallelism is off and every expert is resident."""
+    parallel = layer.moe_config.moe_parallel_config
+    total = int(layer.global_num_experts)
+    expert_map = layer.expert_map_manager.expert_map
+    if expert_map is None:
+        local = tuple(range(total))
+    else:
+        local = tuple(int(i) for i in (expert_map >= 0).nonzero().flatten().tolist())
+    return MoeSharding(
+        ep_rank=int(parallel.ep_rank),
+        ep_size=int(parallel.ep_size),
+        global_num_experts=total,
+        local_experts=local,
     )

@@ -149,7 +149,18 @@ vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_ran
   host_visible_chips="", layers="0-31"} 1
 
 vllm:layer_placement_info{engine="0", rank="1", module="model", layer_subset="0-31",
-  attention_kind="full", q_heads="8-15", kv_heads="2-3", kv_replicated="False"} 1
+  attention_kind="full", q_heads="8-15", kv_heads="2-3", kv_replicated="False", linear_state="",
+  mlp_intermediate="3584-7167", total_experts="", local_experts="", shared_expert_intermediate=""} 1
+```
+
+For example, Qwen3.5-4B at TP=4 (three Gated-DeltaNet layers per full-attention
+layer) gives each rank two layer series:
+
+```text
+vllm:layer_placement_info{engine="0", rank="1", module="model", layer_subset="0-2,4-6,…,28-30",
+  attention_kind="GDN_ATTN", linear_state="3x1x2048|8x128x128", mlp_intermediate="2304-4607", …} 1
+vllm:layer_placement_info{engine="0", rank="1", module="model", layer_subset="3,7,11,…,31",
+  attention_kind="full", q_heads="4-7", kv_heads="1", kv_replicated="True", mlp_intermediate="2304-4607", …} 1
 ```
 
 A homogeneous model has exactly one layer series per rank. A hybrid or
@@ -176,8 +187,12 @@ vllm:layer_placement_info * on(engine, rank) group_left(device_id, chip_coords, 
 | Label | Meaning |
 | :--- | :--- |
 | `module`, `layer_subset` | The root module (`model`, `visual`, `draft`, ...) and the subset of its layers whose sharding this series describes, e.g. `0-27` or `1,3,5-7`. Layers with identical attention/MLP sharding are merged, so homogeneous models have one series per rank; a vision tower or draft model never merges with the language model. |
-| `attention_kind` | `full` for softmax attention with a KV cache (the only kind described so far); empty for a group without attention. |
-| `q_heads`, `kv_heads` | Attention heads this tensor-parallel rank computes (inclusive ranges, from `QKVParallelLinear`). `kv_replicated="True"` means `num_kv_heads < tp_size` and the single KV head is shared by several ranks. |
+| `attention_kind` | `full` for softmax attention with a KV cache, or vLLM's linear-attention backend name (`GDN_ATTN` for Gated DeltaNet in Qwen3.5 / Qwen3-Next, `MAMBA2`, ...) for layers that keep a recurrent state instead; empty for a group without attention. |
+| `linear_state` | For linear-attention / state-space layers (Gated DeltaNet in Qwen3.5 and Qwen3-Next, Kimi Delta Attention, Mamba) there are no KV heads; instead the rank holds a slice of the layer's recurrent state. `linear_state` is the per-rank state shapes from `get_state_shape()`, e.g. `256x4|8x128x128` (conv state, SSM state). In a hybrid model these layers form their own `layer_subset`, separate from the full-attention layers. |
+| `q_heads`, `kv_heads` | Attention heads this tensor-parallel rank computes (inclusive ranges, from `QKVParallelLinear`). `kv_replicated="True"` means `num_kv_heads < tp_size` and the single KV head is shared by several ranks; MLA models (DeepSeek, Kimi) always report their one latent KV head this way. |
+| `mlp_intermediate` | Columns of the dense MLP intermediate dimension this rank holds (its `gate_proj`/`up_proj` rows and `down_proj` columns). |
+| `total_experts`, `local_experts` | Number of routed experts in the layer and the ids resident on this rank, e.g. `60` and `0-7` under `--enable-expert-parallel` (`ep_size = tp_size x dp_size`), or `0-59` on every rank without EP. Read from the routed-experts layer's expert map. |
+| `shared_expert_intermediate` | MoE blocks with always-on shared expert(s) (Qwen1.5/2-MoE, DeepSeek, Llama 4) hold them as one fused dense MLP that is tensor-parallel-sharded like `mlp_intermediate`, and replicated across data-parallel engines. The range is this rank's slab of its intermediate width; e.g. Qwen1.5-MoE's `0-1407` of 5632 is one quarter of the 4 x 1408 shared experts described in its paper. |
 
 The same payload is also written once to the server log as a single JSON line
 prefixed `rank_placement`, for installations without a metrics scraper.

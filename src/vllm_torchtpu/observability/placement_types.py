@@ -57,15 +57,56 @@ class AttentionSharding:
 
 
 @dataclass(frozen=True)
+class LinearAttentionSharding:
+    """Recurrent state one rank holds in a linear-attention / SSM layer
+    (Gated DeltaNet, Kimi Delta Attention, Mamba): ``kind`` is vLLM's
+    ``mamba_type`` and ``state_shapes`` its per-rank ``get_state_shape()``."""
+
+    kind: str
+    state_shapes: tuple[tuple[int, ...], ...]
+    tp_replicated: bool
+
+
+@dataclass(frozen=True)
+class MlpSharding:
+    """Columns of the dense MLP intermediate dim one rank holds."""
+
+    intermediate: Range
+    total_intermediate: int
+
+
+@dataclass(frozen=True)
+class MoeSharding:
+    """Routed experts resident on one rank."""
+
+    ep_rank: int
+    ep_size: int
+    global_num_experts: int
+    local_experts: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class LayerGroup:
     """Layers of one root module that shard identically on this rank."""
 
     root: str
     layers: tuple[int, ...]
     attn: AttentionSharding | None = None
+    linear_attn: LinearAttentionSharding | None = None
+    mlp: MlpSharding | None = None
+    moe: MoeSharding | None = None
+    shared_mlp: MlpSharding | None = None
+    """The MoE block's always-on shared expert(s), fused into one dense MLP."""
 
     def sharding_key(self) -> tuple:
-        return (self.root, self.attn)
+        return (
+            self.root,
+            self.attn,
+            self.linear_attn,
+            self.mlp,
+            self.moe,
+            self.shared_mlp,
+        )
 
 
 @dataclass(frozen=True)
@@ -168,12 +209,27 @@ LAYER_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec("module", "[text] root module of the layers, e.g. 'model', 'visual'"),
     LabelSpec("layer_subset", "[id list] layers of `module` sharing this sharding"),
     LabelSpec(
-        "attention_kind", "[text] 'full' (softmax, KV cache); '' if no attention"
+        "attention_kind",
+        "[text] 'full' (softmax, KV cache) or vLLM's linear-attention backend, "
+        "e.g. 'GDN_ATTN', 'MAMBA2'; '' if the group has no attention",
     ),
-    LabelSpec("q_heads", "[range] query heads this rank computes"),
+    LabelSpec("q_heads", "[range] query heads this rank computes (full attention)"),
     LabelSpec("kv_heads", "[range] KV heads this rank holds; one head when replicated"),
     LabelSpec(
         "kv_replicated", "[bool] num_kv_heads < TP: a KV head is shared by ranks"
+    ),
+    LabelSpec(
+        "linear_state", "[shapes] per-rank recurrent state, e.g. '3x1x2048|8x128x128'"
+    ),
+    LabelSpec("mlp_intermediate", "[range] dense MLP intermediate slab on this rank"),
+    LabelSpec("total_experts", "[count] routed experts in the layer; '' without MoE"),
+    LabelSpec(
+        "local_experts",
+        "[id list] routed experts resident on this rank; '' without MoE",
+    ),
+    LabelSpec(
+        "shared_expert_intermediate",
+        "[range] intermediate slab of the MoE block's fused shared expert(s)",
     ),
 )
 

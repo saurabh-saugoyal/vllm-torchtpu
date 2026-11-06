@@ -23,8 +23,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
-from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
+from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 
 from vllm_torchtpu.observability.placement_types import DeviceIdentity
@@ -43,6 +47,16 @@ def attention(num_heads: int, num_kv_heads: int) -> Attention:
     return _bare(Attention, num_heads=num_heads, num_kv_heads=num_kv_heads)
 
 
+def mla_attention(num_heads: int) -> MLAAttention:
+    """Per-rank Q heads; vLLM sets ``num_kv_heads = 1`` (the latent KV)."""
+    return _bare(MLAAttention, num_heads=num_heads, num_kv_heads=1)
+
+
+def encoder_attention(num_heads: int) -> MMEncoderAttention:
+    """Vision-tower attention: per-rank heads, MHA (kv == q)."""
+    return _bare(MMEncoderAttention, num_heads=num_heads, num_kv_heads=num_heads)
+
+
 def qkv_proj(total_heads: int, total_kv_heads: int, tp_size: int) -> QKVParallelLinear:
     replicas = tp_size // total_kv_heads if tp_size > total_kv_heads else 1
     return _bare(
@@ -52,6 +66,14 @@ def qkv_proj(total_heads: int, total_kv_heads: int, tp_size: int) -> QKVParallel
         num_heads=total_heads // tp_size,
         num_kv_heads=max(1, total_kv_heads // tp_size),
         num_kv_head_replicas=replicas,
+    )
+
+
+def down_proj(intermediate: int, tp_size: int) -> RowParallelLinear:
+    return _bare(
+        RowParallelLinear,
+        input_size=intermediate,
+        input_size_per_partition=intermediate // tp_size,
     )
 
 
@@ -71,25 +93,60 @@ class GatedDeltaNet(torch.nn.Module, MambaBase):
 
     @property
     def mamba_type(self):
-        return SimpleNamespace(name="GDN")  # the backend enum member, as read
+        return SimpleNamespace(
+            name="GDN"
+        )  # the backend enum member, as the provider reads it
 
     def get_state_dtype(self):
         return (torch.bfloat16, torch.float32)
 
 
+class MoeBlock(torch.nn.Module):
+    """vLLM's ``Qwen2MoeSparseMoeBlock`` shape: routed experts + fused shared expert."""
+
+    def __init__(self, global_experts, ep_rank, ep_size, tp_size, shared_intermediate):
+        super().__init__()
+        self.experts = routed_experts(global_experts, ep_rank, ep_size)
+        self.shared_expert = torch.nn.Module()
+        self.shared_expert.down_proj = down_proj(shared_intermediate, tp_size)
+
+
+def routed_experts(global_experts: int, ep_rank: int, ep_size: int) -> RoutedExperts:
+    per = global_experts // ep_size
+    expert_map = None
+    if ep_size > 1:  # vLLM: global id -> local slot, -1 if not resident
+        expert_map = torch.full((global_experts,), -1, dtype=torch.int32)
+        expert_map[ep_rank * per : (ep_rank + 1) * per] = torch.arange(per)
+    return _bare(
+        RoutedExperts,
+        global_num_experts=global_experts,
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(ep_rank=ep_rank, ep_size=ep_size)
+        ),
+        expert_map_manager=SimpleNamespace(expert_map=expert_map),
+    )
+
+
 class AttentionBlock(torch.nn.Module):
     """Owner of ``attn`` and ``qkv_proj`` (vLLM's ``LlamaAttention`` shape)."""
 
-    def __init__(self, total_heads, total_kv_heads, tp_size):
+    def __init__(self, total_heads, total_kv_heads, tp_size, encoder=False):
         super().__init__()
         self.qkv_proj = qkv_proj(total_heads, total_kv_heads, tp_size)
-        self.attn = attention(self.qkv_proj.num_heads, self.qkv_proj.num_kv_heads)
+        if encoder:
+            self.attn = encoder_attention(self.qkv_proj.num_heads)
+        else:
+            self.attn = attention(self.qkv_proj.num_heads, self.qkv_proj.num_kv_heads)
 
 
 class DenseLayer(torch.nn.Module):
-    def __init__(self, tp_size, heads=32, kv_heads=8):
+    def __init__(
+        self, tp_size, heads=32, kv_heads=8, intermediate=14336, encoder=False
+    ):
         super().__init__()
-        self.self_attn = AttentionBlock(heads, kv_heads, tp_size)
+        self.self_attn = AttentionBlock(heads, kv_heads, tp_size, encoder=encoder)
+        self.mlp = torch.nn.Module()
+        self.mlp.down_proj = down_proj(intermediate, tp_size)
 
 
 class FakeModel(torch.nn.Module):

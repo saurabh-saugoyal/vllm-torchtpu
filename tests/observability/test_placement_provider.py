@@ -25,7 +25,7 @@ import torch
 from tests.observability import placement_fakes as fakes
 from vllm_torchtpu.observability import placement_provider
 from vllm_torchtpu.observability.placement_provider import describe_rank_placement
-from vllm_torchtpu.observability.placement_types import DeviceIdentity
+from vllm_torchtpu.observability.placement_types import DeviceIdentity, MlpSharding
 
 
 @pytest.fixture
@@ -112,16 +112,24 @@ def test_device_identity(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "tp_rank,q_heads,kv_heads",
-    [(0, (0, 8), (0, 2)), (1, (8, 16), (2, 4)), (3, (24, 32), (6, 8))],
+    "tp_rank,q_heads,kv_heads,intermediate",
+    [
+        (0, (0, 8), (0, 2), (0, 3584)),
+        (1, (8, 16), (2, 4), (3584, 7168)),
+        (3, (24, 32), (6, 8), (10752, 14336)),
+    ],
 )
-def test_dense_tp4(monkeypatch, quiet_device, tp_rank, q_heads, kv_heads):
+def test_dense_tp4(monkeypatch, quiet_device, tp_rank, q_heads, kv_heads, intermediate):
     fakes.fake_parallel_state(monkeypatch, tp_rank=tp_rank, tp_size=4)
     group = only_group(describe(fakes.dense_model(tp_size=4), rank=tp_rank))
     assert group.root == "model" and group.layers == (0, 1, 2, 3)
-    assert group.attn.kind == "full"
     assert (group.attn.q_heads, group.attn.kv_heads) == (q_heads, kv_heads)
-    assert not group.attn.kv_replicated
+    assert group.attn.kind == "full" and not group.attn.kv_replicated
+    assert (group.mlp.intermediate, group.mlp.total_intermediate) == (
+        intermediate,
+        14336,
+    )
+    assert group.moe is None
 
 
 @pytest.mark.parametrize(
@@ -136,30 +144,120 @@ def test_kv_heads_replicated_when_fewer_than_tp(monkeypatch, quiet_device, rank,
     assert attn.q_heads == (rank * 4, (rank + 1) * 4)
 
 
-def test_mla_attention_without_qkv_proj(monkeypatch, quiet_device):
-    """MLA has no QKVParallelLinear: totals derive from per-rank counts."""
+def test_mla_latent_kv_is_replicated_across_tp(monkeypatch, quiet_device):
+    """DeepSeek MLA: Q heads split by TP, the single latent KV head on every rank."""
     fakes.fake_parallel_state(monkeypatch, tp_rank=2, tp_size=4)
     layer = torch.nn.Module()
     layer.self_attn = torch.nn.Module()
-    layer.self_attn.mla_attn = fakes.attention(num_heads=4, num_kv_heads=1)
+    layer.self_attn.mla_attn = fakes.mla_attention(num_heads=4)
     attn = only_group(describe(fakes.FakeModel([layer]), rank=2)).attn
-    assert attn.q_heads == (8, 12) and attn.kv_heads == (2, 3)
-    assert attn.total_q_heads == 16 and not attn.kv_replicated
+    assert attn.q_heads == (8, 12) and attn.total_q_heads == 16
+    assert attn.kv_heads == (0, 1) and attn.total_kv_heads == 1 and attn.kv_replicated
 
 
-def test_linear_attention_layers_do_not_fail_the_description(monkeypatch, quiet_device):
-    """Qwen3.5 / Qwen3-Next: GDN layers are ``MambaBase`` without head counts;
-    they form their own group, described by a later change."""
+def test_expert_parallel(monkeypatch, quiet_device):
+    fakes.fake_parallel_state(monkeypatch, tp_rank=0, tp_size=1)
+    layer = torch.nn.Module()
+    layer.mlp = torch.nn.Module()
+    layer.mlp.experts = fakes.routed_experts(128, ep_rank=3, ep_size=4)
+    moe = only_group(describe(fakes.FakeModel([layer]), rank=3, dp_rank=3)).moe
+    assert (moe.ep_rank, moe.ep_size, moe.global_num_experts) == (3, 4, 128)
+    assert moe.local_experts == tuple(range(96, 128))
+
+
+def test_shared_expert_is_reported_apart_from_dense_mlp(monkeypatch, quiet_device):
+    """Qwen1.5-MoE: 60 routed experts over EP plus one fused shared expert
+    (width 4 x 1408) that is TP-sharded like a dense MLP."""
     fakes.fake_parallel_state(monkeypatch, tp_rank=1, tp_size=4)
+    layer = torch.nn.Module()
+    layer.mlp = fakes.MoeBlock(
+        60, ep_rank=5, ep_size=8, tp_size=4, shared_intermediate=5632
+    )
+    group = only_group(describe(fakes.FakeModel([layer]), rank=1, dp_rank=1))
+    assert group.mlp is None
+    assert group.shared_mlp == MlpSharding((1408, 2816), 5632)
+    assert group.moe.global_num_experts == 60
+    assert group.moe.local_experts == tuple(range(35, 42))
+
+
+def test_quant_method_submodule_is_not_a_moe_layer(monkeypatch, quiet_device):
+    fakes.fake_parallel_state(monkeypatch, tp_rank=0, tp_size=1)
+    layer = torch.nn.Module()
+    layer.mlp = torch.nn.Module()
+    layer.mlp.experts = fakes.routed_experts(8, 0, 1)
+    layer.mlp.experts.quant_method = torch.nn.Module()  # not a RoutedExperts
+    assert only_group(describe(fakes.FakeModel([layer]))).moe.local_experts == tuple(
+        range(8)
+    )
+
+
+def test_hybrid_layers_group_by_sharding(monkeypatch, quiet_device):
+    """Attention on even layers, dense MLP on 0-1, MoE on 2-3 -> four groups."""
+    fakes.fake_parallel_state(monkeypatch, tp_rank=1, tp_size=2)
     layers = []
     for i in range(4):
         layer = torch.nn.Module()
-        if i == 3:
+        if i % 2 == 0:
+            layer.self_attn = fakes.AttentionBlock(16, 4, tp_size=2)
+        layer.mlp = torch.nn.Module()
+        if i < 2:
+            layer.mlp.down_proj = fakes.down_proj(8192, 2)
+        else:
+            layer.mlp.experts = fakes.routed_experts(64, ep_rank=1, ep_size=2)
+        layers.append(layer)
+    groups = describe(fakes.FakeModel(layers), rank=1).layer_groups
+    assert [g.layers for g in groups] == [(0,), (1,), (2,), (3,)]
+    assert groups[0].attn.q_heads == (8, 16) and groups[0].mlp
+    assert groups[1].attn is None and groups[1].mlp.intermediate == (4096, 8192)
+    assert groups[2].attn and groups[2].moe.local_experts == tuple(range(32, 64))
+    assert groups[3].attn is None and groups[3].mlp is None and groups[3].moe
+
+
+def test_linear_attention_layers_interleaved_with_full_attention(
+    monkeypatch, quiet_device
+):
+    """Qwen3.5 / Qwen3-Next: three GDN layers then one full-attention layer,
+    all with the same dense MLP -> two groups, by attention kind."""
+    fakes.fake_parallel_state(monkeypatch, tp_rank=1, tp_size=4)
+    layers = []
+    for i in range(8):
+        layer = torch.nn.Module()
+        if i % 4 == 3:
             layer.self_attn = fakes.AttentionBlock(16, 4, tp_size=4)
         else:
             layer.linear_attn = fakes.GatedDeltaNet(num_v_heads=32, tp_size=4)
+        layer.mlp = torch.nn.Module()
+        layer.mlp.down_proj = fakes.down_proj(8192, 4)
         layers.append(layer)
-    p = describe(fakes.FakeModel(layers), rank=1)
-    assert p.error is None
-    assert [g.layers for g in p.layer_groups] == [(0, 1, 2), (3,)]
-    assert p.layer_groups[0].attn is None and p.layer_groups[1].attn.q_heads == (4, 8)
+    groups = describe(fakes.FakeModel(layers), rank=1).layer_groups
+    assert [g.layers for g in groups] == [(0, 1, 2, 4, 5, 6), (3, 7)]
+    linear, full = groups
+    assert linear.attn is None and full.linear_attn is None
+    assert linear.linear_attn.kind == "GDN" and not linear.linear_attn.tp_replicated
+    assert linear.linear_attn.state_shapes == ((128, 4), (8, 128, 128))
+    assert full.attn.q_heads == (4, 8)
+    assert linear.mlp == full.mlp
+
+
+def test_vision_tower_and_draft_do_not_merge_with_language_model(
+    monkeypatch, quiet_device
+):
+    fakes.fake_parallel_state(monkeypatch, tp_rank=0, tp_size=2)
+    model = fakes.dense_model(tp_size=2, num_layers=2)
+    model.visual = torch.nn.Module()
+    model.visual.blocks = torch.nn.ModuleList(
+        [fakes.DenseLayer(2, heads=16, kv_heads=16, intermediate=4096, encoder=True)]
+    )
+    model.draft = torch.nn.Module()
+    model.draft.layers = torch.nn.ModuleList(
+        [fakes.DenseLayer(2)]
+    )  # same sharding as model
+    groups = describe(model).layer_groups
+    assert sorted((g.root, g.layers) for g in groups) == [
+        ("draft", (0,)),
+        ("model", (0, 1)),
+        ("visual", (0,)),
+    ]
+    visual = next(g for g in groups if g.root == "visual")
+    assert visual.attn.q_heads == (0, 8) and visual.attn.kv_heads == (0, 8)
+    assert visual.attn.total_kv_heads == 16 and not visual.attn.kv_replicated
