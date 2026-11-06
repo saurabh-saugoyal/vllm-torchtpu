@@ -771,9 +771,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the in-tree experimental RPA kernel modules; see
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
-    # Publish the engine's parallel configuration (vllm:parallel_config_info)
-    # once at startup, before the server accepts requests. See
-    # observability/placement_hook.py.
+    # Publish the engine's parallel configuration and each rank's chip
+    # placement (vllm:parallel_config_info, vllm:tpu_placement_info) once at
+    # startup, before the server accepts requests. See observability/placement_hook.py.
     "VLLM_TPU_EMIT_PLACEMENT": lambda: bool(
         int(os.getenv("VLLM_TPU_EMIT_PLACEMENT") or "1")
     ),

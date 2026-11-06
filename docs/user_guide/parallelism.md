@@ -121,13 +121,13 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
 
 ---
 
-## 6. Observability: how the engine is parallelised
+## 6. Observability: which rank holds what
 
 Once the model is loaded and before the server accepts requests, `vllm-torchtpu`
-publishes a static Prometheus info gauge (value `1`, the same idiom as vLLM's
-`vllm:cache_config_info`) on the regular `/metrics` endpoint. It is set once
-and never changes for the life of the process, so a scraper keeps it for as
-long as its retention allows, which makes it usable for post-mortem analysis
+publishes two static Prometheus info gauges (value `1`, the same idiom as vLLM's
+`vllm:cache_config_info`) on the regular `/metrics` endpoint. They are set once
+and never change for the life of the process, so a scraper keeps them for as
+long as its retention allows, which makes them usable for post-mortem analysis
 of a deployment that no longer exists.
 
 ```text
@@ -135,7 +135,17 @@ of a deployment that no longer exists.
 vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
   data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
   decode_context_parallel_size="1", world_size="4", nnodes="1"} 1
+
+# One series per rank: its position in each parallel group and the layers it holds.
+vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0",
+  layers="0-31"} 1
 ```
+
+| Label | Meaning |
+| :--- | :--- |
+| `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
+| `node_rank` | Host of the engine's slice this rank runs on (`--nnodes` multi-host); `0` on single-host engines. |
+| `layers` | Transformer layers held by this pipeline stage (inclusive range). |
 
 The same payload is also written once to the server log as a single JSON line
 prefixed `tpu_placement`, for installations without a metrics scraper.

@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""API-server-side emitter: publish the parallel config and rank placements.
+"""API-server-side emitter: publish rank placements as Prometheus info gauges.
 
-``vllm:parallel_config_info`` is a gauge of value ``1`` with the facts in the
-labels (the ``vllm:cache_config_info`` idiom), once per engine. The same
-payload, plus every rank's placement, goes to the log once as a
-``tpu_placement`` JSON line.
+Two gauges, value ``1`` with the facts in the labels (the
+``vllm:cache_config_info`` idiom): ``vllm:parallel_config_info`` once per
+engine and ``vllm:tpu_placement_info`` once per rank. The same payload goes
+to the log once as a ``tpu_placement`` JSON line.
 """
 
 from __future__ import annotations
@@ -32,7 +32,9 @@ from vllm.config import ParallelConfig
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.observability.placement_types import (
     PARALLEL_CONFIG_LABELS,
+    PLACEMENT_LABELS,
     ParallelSummary,
+    Range,
     RankPlacement,
     label_names,
 )
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PARALLEL_CONFIG_METRIC = "vllm:parallel_config_info"
+PLACEMENT_METRIC = "vllm:tpu_placement_info"
 
 _gauges: dict[str, Gauge] = {}
 
@@ -61,8 +64,29 @@ def parallel_summary(parallel_config: ParallelConfig) -> ParallelSummary:
     )
 
 
+def format_range(bounds: Range | None) -> str:
+    """Half-open ``(8, 16)`` -> inclusive ``"8-15"``; ``"8"`` for one element."""
+    if bounds is None:
+        return ""
+    start, stop = bounds
+    return str(start) if stop - start == 1 else f"{start}-{stop - 1}"
+
+
 def _label(value: object) -> str:
     return "" if value is None else str(value)
+
+
+def placement_labels(placement: RankPlacement) -> dict[str, str]:
+    return {
+        "engine": str(placement.dp_rank),
+        "rank": str(placement.rank),
+        "tp_rank": _label(placement.tp_rank),
+        "pp_rank": _label(placement.pp_rank),
+        "pcp_rank": _label(placement.pcp_rank),
+        "dcp_rank": _label(placement.dcp_rank),
+        "node_rank": str(placement.node_rank),
+        "layers": format_range(placement.layers),
+    }
 
 
 def parallel_config_labels(summary: ParallelSummary, engine: int) -> dict[str, str]:
@@ -90,16 +114,23 @@ def _gauge(name: str, documentation: str, labelnames: list[str]) -> Gauge:
 def emit_prometheus(
     summary: ParallelSummary, placements: Sequence[RankPlacement]
 ) -> None:
-    """One ``vllm:parallel_config_info`` series per engine that reported ranks."""
-    if vllm_exports_parallel_config_info():
-        return
+    engines = sorted({p.dp_rank for p in placements}) or [0]
+    if not vllm_exports_parallel_config_info():
+        gauge = _gauge(
+            PARALLEL_CONFIG_METRIC,
+            "Information of the LLMEngine ParallelConfig",
+            label_names(PARALLEL_CONFIG_LABELS),
+        )
+        for engine in engines:
+            gauge.labels(**parallel_config_labels(summary, engine)).set(1)
     gauge = _gauge(
-        PARALLEL_CONFIG_METRIC,
-        "Information of the LLMEngine ParallelConfig",
-        label_names(PARALLEL_CONFIG_LABELS),
+        PLACEMENT_METRIC,
+        "Parallel-group position of each rank and the layers it holds; "
+        "one series per rank",
+        label_names(PLACEMENT_LABELS),
     )
-    for engine in sorted({p.dp_rank for p in placements}) or [0]:
-        gauge.labels(**parallel_config_labels(summary, engine)).set(1)
+    for placement in placements:
+        gauge.labels(**placement_labels(placement)).set(1)
 
 
 def emit_log(summary: ParallelSummary, placements: Sequence[RankPlacement]) -> None:
@@ -150,9 +181,10 @@ async def publish_placement(
         emit_prometheus(summary, placements)
         emit_log(summary, placements)
         logger.info(
-            "Published %s and the placement of %d rank(s).",
-            PARALLEL_CONFIG_METRIC,
+            "Published TPU placement for %d rank(s) as %s and %s.",
             len(placements),
+            PARALLEL_CONFIG_METRIC,
+            PLACEMENT_METRIC,
         )
     except Exception as error:  # noqa: BLE001 - see docstring
         logger.warning("Could not publish TPU placement: %s", error)

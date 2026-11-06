@@ -118,4 +118,4 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
-| `VLLM_TPU_EMIT_PLACEMENT` | `True` | Publishes `vllm:parallel_config_info` on `/metrics` once at startup. See [Parallelism & Scaling](../user_guide/parallelism.md#observability-how-the-engine-is-parallelised). |
+| `VLLM_TPU_EMIT_PLACEMENT` | `True` | Publishes `vllm:parallel_config_info` and `vllm:tpu_placement_info` (where each rank sits in the parallel groups and which layers it holds) on `/metrics` once at startup. See [Parallelism & Scaling](../user_guide/parallelism.md#observability-which-rank-holds-what). |

@@ -66,7 +66,8 @@ class LabelSpec:
 
 
 # Label value formats: [index] 0-based position; [count] size; [bool]
-# "True"/"False". Gauge value is always 1.
+# "True"/"False"; [range] inclusive "a-b" ("a" if one element). "" means not
+# applicable. Gauge value is always 1.
 
 PARALLEL_CONFIG_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec(
@@ -80,6 +81,19 @@ PARALLEL_CONFIG_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec("decode_context_parallel_size", "[count] ranks splitting the KV cache"),
     LabelSpec("world_size", "[count] worker processes per engine = TP x PP x PCP"),
     LabelSpec("nnodes", "[count] hosts one engine spans; 1 unless --nnodes"),
+)
+
+PLACEMENT_LABELS: tuple[LabelSpec, ...] = (
+    LabelSpec("engine", "[index] engine this rank belongs to"),
+    LabelSpec("rank", "[index] worker process within the engine, 0..world_size-1"),
+    LabelSpec("tp_rank", "[index] position in the tensor-parallel group"),
+    LabelSpec("pp_rank", "[index] pipeline stage"),
+    LabelSpec("pcp_rank", "[index] prefill-context group: which prompt chunk"),
+    LabelSpec(
+        "dcp_rank", "[index] decode-context group: which KV shard (reuses TP ranks)"
+    ),
+    LabelSpec("node_rank", "[index] host of the engine's slice, 0..nnodes-1"),
+    LabelSpec("layers", "[range] layers held by this pipeline stage"),
 )
 
 

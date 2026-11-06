@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Emitter: the parallel-config gauge, log line and cross-engine collection."""
+"""Emitter: labels, gauges, log line, cross-engine collection."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from prometheus_client import CollectorRegistry
 from vllm_torchtpu.observability import placement_emitter as emitter
 from vllm_torchtpu.observability.placement_types import (
     PARALLEL_CONFIG_LABELS,
+    PLACEMENT_LABELS,
     RankPlacement,
     label_names,
 )
@@ -84,6 +85,32 @@ def test_parallel_config_labels_exact():
     assert list(labels) == label_names(PARALLEL_CONFIG_LABELS)
 
 
+def test_placement_labels_exact():
+    p = placement(1, pcp_rank=0, dcp_rank=1, node_rank=1)
+    labels = emitter.placement_labels(p)
+    assert labels == {
+        "engine": "0",
+        "rank": "1",
+        "tp_rank": "1",
+        "pp_rank": "0",
+        "pcp_rank": "0",
+        "dcp_rank": "1",
+        "node_rank": "1",
+        "layers": "0-31",
+    }
+    assert list(labels) == label_names(PLACEMENT_LABELS)
+
+
+def test_labels_blank_when_not_applicable():
+    labels = emitter.placement_labels(placement(2, layers=None))
+    assert labels["pcp_rank"] == "" and labels["layers"] == ""
+
+
+@pytest.mark.parametrize("bounds,text", [(None, ""), ((3, 4), "3"), ((8, 16), "8-15")])
+def test_format_range(bounds, text):
+    assert emitter.format_range(bounds) == text
+
+
 # ------------------------------------------------------------------- gauges
 
 
@@ -111,12 +138,20 @@ def series(reg, name):
     }
 
 
-def test_emit_prometheus_one_series_per_reporting_engine(registry):
+def test_emit_prometheus_one_series_per_rank_and_engine(registry):
     ps = [placement(0), placement(1), placement(0, dp_rank=1), placement(1, dp_rank=1)]
     emitter.emit_prometheus(emitter.parallel_summary(parallel_config()), ps)
     parallel = series(registry, emitter.PARALLEL_CONFIG_METRIC)
-    assert {dict(k)["engine"] for k in parallel} == {"0", "1"}
-    assert set(parallel.values()) == {1.0}
+    assert {dict(k)["engine"] for k in parallel} == {"0", "1"} and set(
+        parallel.values()
+    ) == {1.0}
+    per_rank = series(registry, emitter.PLACEMENT_METRIC)
+    assert {(dict(k)["engine"], dict(k)["rank"]) for k in per_rank} == {
+        ("0", "0"),
+        ("0", "1"),
+        ("1", "0"),
+        ("1", "1"),
+    }
 
 
 def test_emit_prometheus_idempotent(registry):
@@ -124,13 +159,14 @@ def test_emit_prometheus_idempotent(registry):
     summary = emitter.parallel_summary(parallel_config())
     emitter.emit_prometheus(summary, ps)
     emitter.emit_prometheus(summary, ps)
-    assert len(series(registry, emitter.PARALLEL_CONFIG_METRIC)) == 1
+    assert len(series(registry, emitter.PLACEMENT_METRIC)) == 1
 
 
 def test_parallel_config_metric_skipped_when_vllm_has_it(registry, monkeypatch):
     monkeypatch.setattr(emitter, "vllm_exports_parallel_config_info", lambda: True)
     emitter.emit_prometheus(emitter.parallel_summary(parallel_config()), [placement(0)])
     assert series(registry, emitter.PARALLEL_CONFIG_METRIC) == {}
+    assert len(series(registry, emitter.PLACEMENT_METRIC)) == 1
 
 
 def test_emit_log_is_one_json_line(caplog):
