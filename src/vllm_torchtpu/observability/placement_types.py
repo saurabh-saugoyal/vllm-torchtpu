@@ -76,6 +76,16 @@ class MlpSharding:
 
 
 @dataclass(frozen=True)
+class MoeSharding:
+    """Routed experts resident on one rank."""
+
+    ep_rank: int
+    ep_size: int
+    global_num_experts: int
+    local_experts: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class LayerGroup:
     """Layers of one root module that shard identically on this rank."""
 
@@ -84,9 +94,19 @@ class LayerGroup:
     attn: AttentionSharding | None = None
     linear_attn: LinearAttentionSharding | None = None
     mlp: MlpSharding | None = None
+    moe: MoeSharding | None = None
+    shared_mlp: MlpSharding | None = None
+    """The MoE block's always-on shared expert(s), fused into one dense MLP."""
 
     def sharding_key(self) -> tuple:
-        return (self.root, self.attn, self.linear_attn, self.mlp)
+        return (
+            self.root,
+            self.attn,
+            self.linear_attn,
+            self.mlp,
+            self.moe,
+            self.shared_mlp,
+        )
 
 
 @dataclass(frozen=True)
@@ -168,6 +188,9 @@ PLACEMENT_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec(
         "dcp_rank", "[index] decode-context group: which KV shard (reuses TP ranks)"
     ),
+    LabelSpec(
+        "ep_rank", "[index] expert-parallel group (spans TP x DP); '' without MoE"
+    ),
     LabelSpec("node_rank", "[index] host of the engine's slice, 0..nnodes-1"),
     LabelSpec("device_id", "[index] logical device (core) in the runtime's numbering"),
     LabelSpec(
@@ -196,6 +219,15 @@ PLACEMENT_LABELS: tuple[LabelSpec, ...] = (
         "linear_state", "[shapes] per-rank recurrent state, e.g. '4x128x128|4x4x128'"
     ),
     LabelSpec("mlp_intermediate", "[range] dense MLP intermediate slab on this rank"),
+    LabelSpec("total_experts", "[count] routed experts in the layer; '' without MoE"),
+    LabelSpec(
+        "local_experts",
+        "[id list] routed experts resident on this rank; '' without MoE",
+    ),
+    LabelSpec(
+        "shared_expert_intermediate",
+        "[range] intermediate slab of the MoE block's fused shared expert(s)",
+    ),
 )
 
 

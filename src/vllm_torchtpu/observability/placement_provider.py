@@ -16,7 +16,8 @@
 Runs once in each worker after the model is loaded. Reads vLLM's parallel
 groups, the device this process is pinned to, and the sharded layers' own
 attributes (``Attention.num_heads``, ``RowParallelLinear.input_size_per_
-partition``). Nothing is computed from model names or config strings.
+partition``, the routed-experts layer's expert map). Nothing is computed from
+model names or config strings.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from collections import defaultdict
 import torch
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.models.utils import extract_layer_index
@@ -38,6 +40,7 @@ from vllm_torchtpu.observability.placement_types import (
     LayerGroup,
     LinearAttentionSharding,
     MlpSharding,
+    MoeSharding,
     Range,
     RankPlacement,
 )
@@ -147,8 +150,8 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
     A layer is identified by its root module (the first name component, so a
     vision tower, a draft model and the language model never merge) and its
     index from vLLM's ``extract_layer_index``. Layers with equal attention /
-    MLP sharding collapse into one group, so a homogeneous model yields one
-    group and a hybrid model one per layer type.
+    MLP / MoE / shared-expert sharding collapse into one group, so a
+    homogeneous model yields one group and a hybrid model one per layer type.
     """
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     modules = dict(model.named_modules())
@@ -170,6 +173,8 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
             attn=parts.get("attn"),  # type: ignore[arg-type]
             linear_attn=parts.get("linear_attn"),  # type: ignore[arg-type]
             mlp=parts.get("mlp"),  # type: ignore[arg-type]
+            moe=parts.get("moe"),  # type: ignore[arg-type]
+            shared_mlp=parts.get("shared_mlp"),  # type: ignore[arg-type]
         )
         key = candidate.sharding_key()
         if key in groups:
@@ -179,10 +184,17 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
                 candidate.attn,
                 candidate.linear_attn,
                 candidate.mlp,
+                candidate.moe,
+                candidate.shared_mlp,
             )
         else:
             groups[key] = candidate
     return tuple(groups.values())
+
+
+# vLLM's attribute names for the always-on expert(s) of a MoE block
+# (Qwen2-MoE / Llama 4: ``shared_expert``; DeepSeek: ``shared_experts``).
+_SHARED_EXPERT = frozenset({"shared_expert", "shared_experts"})
 
 
 def _layer_index(module_name: str) -> int | None:
@@ -208,13 +220,16 @@ def _describe_module(
         )
     if isinstance(module, AttentionLayerBase):
         return "attn", _attention_sharding(name, module, modules, tp_rank)
+    if isinstance(module, RoutedExperts):
+        return "moe", _moe_sharding(module)
     if isinstance(module, RowParallelLinear) and name.rsplit(".", 1)[-1] in (
         "down_proj",
         "fc2",
         "c_proj",
         "w2",
     ):
-        return "mlp", MlpSharding(
+        kind = "shared_mlp" if _SHARED_EXPERT.intersection(name.split(".")) else "mlp"
+        return kind, MlpSharding(
             intermediate=(
                 tp_rank * module.input_size_per_partition,
                 (tp_rank + 1) * module.input_size_per_partition,
@@ -267,4 +282,16 @@ def _attention_sharding(
         total_q_heads=total_q,
         total_kv_heads=total_kv,
         gqa_padded=orig_total_q != total_q,
+    )
+
+
+def _moe_sharding(layer: RoutedExperts) -> MoeSharding:
+    parallel = layer.moe_config.moe_parallel_config
+    return MoeSharding(
+        ep_rank=int(parallel.ep_rank),
+        ep_size=int(parallel.ep_size),
+        global_num_experts=int(layer.global_num_experts),
+        local_experts=tuple(
+            int(i) for i in layer.expert_map_manager.get_local_expert_ids()
+        ),
     )

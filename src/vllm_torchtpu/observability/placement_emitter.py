@@ -104,6 +104,8 @@ def placement_labels(
     attn = group.attn if group else None
     linear = group.linear_attn if group else None
     mlp = group.mlp if group else None
+    moe = group.moe if group else None
+    shared = group.shared_mlp if group else None
     return {
         "engine": str(placement.dp_rank),
         "rank": str(placement.rank),
@@ -111,6 +113,7 @@ def placement_labels(
         "pp_rank": _label(placement.pp_rank),
         "pcp_rank": _label(placement.pcp_rank),
         "dcp_rank": _label(placement.dcp_rank),
+        "ep_rank": _label(moe.ep_rank) if moe else "",
         "node_rank": str(placement.node_rank),
         "device_id": _label(device.device_id),
         "chip_index": _label(device.chip_index),
@@ -131,6 +134,11 @@ def placement_labels(
         if linear
         else "",
         "mlp_intermediate": format_range(mlp.intermediate) if mlp else "",
+        "total_experts": _label(moe.global_num_experts) if moe else "",
+        "local_experts": format_ids(moe.local_experts) if moe else "",
+        "shared_expert_intermediate": format_range(shared.intermediate)
+        if shared
+        else "",
     }
 
 
@@ -176,7 +184,7 @@ def emit_prometheus(
             gauge.labels(**parallel_config_labels(summary, engine)).set(1)
     gauge = _gauge(
         PLACEMENT_METRIC,
-        "TPU device each rank runs on and the heads and layers it holds; "
+        "TPU device each rank runs on and the heads, layers and experts it holds; "
         "one series per rank and layer subset",
         label_names(PLACEMENT_LABELS),
     )
@@ -221,6 +229,7 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
         DeviceIdentity,
         LinearAttentionSharding,
         MlpSharding,
+        MoeSharding,
     )
 
     def group(g: dict) -> LayerGroup:
@@ -232,6 +241,8 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
             if g["linear_attn"]
             else None,
             mlp=MlpSharding(**g["mlp"]) if g["mlp"] else None,
+            moe=MoeSharding(**g["moe"]) if g["moe"] else None,
+            shared_mlp=MlpSharding(**g["shared_mlp"]) if g["shared_mlp"] else None,
         )
 
     return RankPlacement(

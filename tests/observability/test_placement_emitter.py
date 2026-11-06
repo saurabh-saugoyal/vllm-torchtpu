@@ -33,6 +33,7 @@ from vllm_torchtpu.observability.placement_types import (
     LayerGroup,
     LinearAttentionSharding,
     MlpSharding,
+    MoeSharding,
     RankPlacement,
     label_names,
 )
@@ -112,6 +113,8 @@ def test_placement_labels_exact():
         tuple(range(32)),
         attn=AttentionSharding((8, 16), (2, 4), False, 32, 8),
         mlp=MlpSharding((3584, 7168), 14336),
+        moe=MoeSharding(1, 8, 60, (0, 1, 2, 5, 6, 9)),
+        shared_mlp=MlpSharding((1408, 2816), 5632),
     )
     p = placement(
         1,
@@ -129,6 +132,7 @@ def test_placement_labels_exact():
         "pp_rank": "0",
         "pcp_rank": "0",
         "dcp_rank": "1",
+        "ep_rank": "1",
         "node_rank": "1",
         "device_id": "1",
         "chip_index": "1",
@@ -145,6 +149,9 @@ def test_placement_labels_exact():
         "linear_attention": "",
         "linear_state": "",
         "mlp_intermediate": "3584-7167",
+        "total_experts": "60",
+        "local_experts": "0-2,5-6,9",
+        "shared_expert_intermediate": "1408-2815",
     }
     assert list(labels) == label_names(PLACEMENT_LABELS)
 
@@ -172,6 +179,7 @@ def test_one_series_per_layer_group():
                 "GDN", ((128, 4), (8, 128, 128)), False
             ),
         ),
+        LayerGroup("model", (5,), moe=MoeSharding(1, 2, 64, tuple(range(32, 64)))),
         LayerGroup(
             "visual", (0,), attn=AttentionSharding((0, 8), (0, 8), False, 16, 16)
         ),
@@ -180,12 +188,18 @@ def test_one_series_per_layer_group():
     assert [(s["module"], s["layer_subset"]) for s in series] == [
         ("model", "0,2"),
         ("model", "1,3"),
+        ("model", "5"),
         ("visual", "0"),
     ]
     assert series[0]["kv_heads"] == "0" and series[1]["q_heads"] == ""
     assert series[1]["linear_attention"] == "GDN"
     assert series[1]["linear_state"] == "128x4|8x128x128"
     assert series[0]["linear_attention"] == ""
+    assert series[2]["local_experts"] == "32-63"
+    assert (
+        series[2]["total_experts"] == "64"
+        and series[2]["shared_expert_intermediate"] == ""
+    )
 
 
 @pytest.mark.parametrize("bounds,text", [(None, ""), ((3, 4), "3"), ((8, 16), "8-15")])

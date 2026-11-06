@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import torch
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 
@@ -85,6 +86,29 @@ class GatedDeltaNet(torch.nn.Module, MambaBase):
 
     def get_state_dtype(self):
         return (torch.bfloat16, torch.float32)
+
+
+class MoeBlock(torch.nn.Module):
+    """vLLM's ``Qwen2MoeSparseMoeBlock`` shape: routed experts + fused shared expert."""
+
+    def __init__(self, global_experts, ep_rank, ep_size, tp_size, shared_intermediate):
+        super().__init__()
+        self.experts = routed_experts(global_experts, ep_rank, ep_size)
+        self.shared_expert = torch.nn.Module()
+        self.shared_expert.down_proj = down_proj(shared_intermediate, tp_size)
+
+
+def routed_experts(global_experts: int, ep_rank: int, ep_size: int) -> RoutedExperts:
+    per = global_experts // ep_size
+    local = list(range(ep_rank * per, (ep_rank + 1) * per))
+    return _bare(
+        RoutedExperts,
+        global_num_experts=global_experts,
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(ep_rank=ep_rank, ep_size=ep_size)
+        ),
+        expert_map_manager=SimpleNamespace(get_local_expert_ids=lambda: local),
+    )
 
 
 class AttentionBlock(torch.nn.Module):

@@ -139,12 +139,13 @@ vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_paralle
 
 # One series per rank and layer group: where it runs and which slice of the
 # model it holds. A homogeneous model has one group per rank; a hybrid model
-# (e.g. alternating full/linear attention) has one
+# (e.g. alternating full/linear attention, or dense-then-MoE layers) has one
 # series per distinct layer type, identified by `layer_subset`.
-vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0",
+vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0", ep_rank="",
   device_id="1", chip_index="1", core_on_chip="0", chip_coords="1,0,0", host_visible_chips="",
   layers="0-31", module="model", layer_subset="0-31", q_heads="8-15", kv_heads="2-3", kv_replicated="False",
-  gqa_padded="False", linear_attention="", linear_state="", mlp_intermediate="3584-7167"} 1
+  gqa_padded="False", linear_attention="", linear_state="", mlp_intermediate="3584-7167",
+  total_experts="", local_experts="", shared_expert_intermediate=""} 1
 ```
 
 | Label | Meaning |
@@ -154,10 +155,12 @@ vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank
 | `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
 | `node_rank` | Host of the engine's slice this rank runs on (`--nnodes` multi-host); `0` on single-host engines. |
 | `layers` | Transformer layers held by this pipeline stage (inclusive range). |
-| `module`, `layer_subset` | The root module (`model`, `visual`, `draft`, ...) and the subset of its layers whose sharding this series describes, e.g. `0-27` or `1,3,5-7`. Layers with identical attention/MLP sharding are merged, so homogeneous models have one series per rank; a vision tower or draft model never merges with the language model. |
+| `module`, `layer_subset` | The root module (`model`, `visual`, `draft`, ...) and the subset of its layers whose sharding this series describes, e.g. `0-27` or `1,3,5-7`. Layers with identical attention/MLP/MoE sharding are merged, so homogeneous models have one series per rank; a vision tower or draft model never merges with the language model. |
 | `q_heads`, `kv_heads` | Attention heads this tensor-parallel rank computes (inclusive ranges, from `QKVParallelLinear`). `kv_replicated="True"` means `num_kv_heads < tp_size` and the single KV head is shared by several ranks. `gqa_padded="True"` means the Q-head count was zero-padded to divide by TP, so the range is in padded head indices. |
 | `linear_attention`, `linear_state` | For linear-attention / state-space layers (Gated DeltaNet in Qwen3.5 and Qwen3-Next, Kimi Delta Attention, Mamba) there are no KV heads; instead the rank holds a slice of the layer's recurrent state. `linear_attention` is vLLM's `mamba_type` (`GDN`, `KDA`, `MAMBA2`, ...) and `linear_state` the per-rank state shapes from `get_state_shape()`, e.g. `256x4|8x128x128` (conv state, SSM state). In a hybrid model these layers form their own `layer_subset`, separate from the full-attention layers. |
 | `mlp_intermediate` | Columns of the dense MLP intermediate dimension this rank holds (its `gate_proj`/`up_proj` rows and `down_proj` columns). |
+| `total_experts`, `local_experts` | Number of routed experts in the layer and the ids resident on this rank, e.g. `60` and `0-7` under `--enable-expert-parallel` (`ep_size = tp_size x dp_size`), or `0-59` on every rank without EP. Read from the routed-experts layer's expert map. |
+| `shared_expert_intermediate` | MoE blocks with always-on shared expert(s) (Qwen1.5/2-MoE, DeepSeek, Llama 4) hold them as one fused dense MLP that is tensor-parallel-sharded like `mlp_intermediate`, and replicated across data-parallel engines. The range is this rank's slab of its intermediate width; e.g. Qwen1.5-MoE's `0-1407` of 5632 is one quarter of the 4 x 1408 shared experts described in its paper. |
 
 The same payload is also written once to the server log as a single JSON line
 prefixed `tpu_placement`, for installations without a metrics scraper.
