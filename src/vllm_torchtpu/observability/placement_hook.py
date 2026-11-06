@@ -82,7 +82,7 @@ def install_lifespan_hook(app: FastAPI) -> None:
 
     @contextlib.asynccontextmanager
     async def lifespan_with_placement(app_: FastAPI):
-        publish_placement(app_.state.engine_client, app_.state.vllm_config)
+        await publish_placement(app_.state.engine_client, app_.state.vllm_config)
         async with inner(app_):
             yield
 

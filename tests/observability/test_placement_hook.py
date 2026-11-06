@@ -38,7 +38,7 @@ def build_app(args, supported_tasks=None, model_config=None):
 def startup_publishes(app):
     seen = []
 
-    def publish(engine_client, vllm_config):
+    async def publish(engine_client, vllm_config):
         seen.append((engine_client, vllm_config))
 
     with patch.object(hook, "publish_placement", publish), TestClient(app):
@@ -55,7 +55,7 @@ def test_lifespan_runs_emitter_before_vllm_lifespan():
         yield
         events.append("vllm-shutdown")
 
-    def publish(engine_client, vllm_config):
+    async def publish(engine_client, vllm_config):
         events.append(("publish", engine_client, vllm_config))
 
     wrapped = hook.wrap_build_app(lambda *a, **k: FastAPI(lifespan=vllm_lifespan))
