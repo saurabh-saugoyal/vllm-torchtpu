@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Typed records describing where a rank sits in the engine's parallel groups."""
+"""Typed records describing where a rank runs.
+
+Vocabulary: a *slice* is every chip the engine's workers can see; a *chip* sits
+at ``chip_coords`` in the ICI mesh and holds ``cores_per_chip`` TensorCores; one
+core is one logical ``device_id`` and one worker process (``rank``). Under
+multi-process data parallelism each engine is pinned to a subset of the host's
+chips (``host_visible_chips``) and the runtime numbers devices and coordinates
+within that subset.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +28,20 @@ from typing import Any
 
 Range = tuple[int, int]
 """Half-open ``[start, stop)`` interval."""
+
+
+@dataclass(frozen=True)
+class DeviceIdentity:
+    """The TPU core a worker process is pinned to."""
+
+    device_id: int | None = None
+    device_kind: str | None = None
+    chip_coords: tuple[int, ...] | None = None
+    core_on_chip: int | None = None
+    chip_index: int | None = None
+    visible_chips: int | None = None
+    cores_per_chip: int | None = None
+    host_visible_chips: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -35,6 +57,7 @@ class RankPlacement:
     pcp_rank: int | None
     dcp_rank: int | None
     node_rank: int
+    device: DeviceIdentity
     layers: Range | None = None
     error: str | None = None
 
@@ -44,7 +67,7 @@ class RankPlacement:
 
 @dataclass(frozen=True)
 class ParallelSummary:
-    """Engine-wide parallel configuration."""
+    """Engine-wide parallel configuration plus the hardware it runs on."""
 
     tensor_parallel_size: int
     pipeline_parallel_size: int
@@ -54,6 +77,9 @@ class ParallelSummary:
     decode_context_parallel_size: int
     world_size: int
     nnodes: int
+    device_kind: str | None = None
+    visible_chips: int | None = None
+    cores_per_chip: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -66,7 +92,9 @@ class LabelSpec:
 
 
 # Label value formats: [index] 0-based position; [count] size; [bool]
-# "True"/"False". Gauge value is always 1.
+# "True"/"False"; [range] inclusive "a-b" ("a" if one element); [id list]
+# compressed "0-2,5,9-11"; [x,y,z] comma-separated ints; [text] runtime string.
+# "" means not applicable. Gauge value is always 1.
 
 PARALLEL_CONFIG_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec(
@@ -80,6 +108,33 @@ PARALLEL_CONFIG_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec("decode_context_parallel_size", "[count] ranks splitting the KV cache"),
     LabelSpec("world_size", "[count] worker processes per engine = TP x PP x PCP"),
     LabelSpec("nnodes", "[count] hosts one engine spans; 1 unless --nnodes"),
+    LabelSpec("device_kind", "[text] e.g. 'TPU v5 lite', 'TPU v6e'"),
+    LabelSpec("visible_chips", "[count] chips the engine's workers can see"),
+    LabelSpec("cores_per_chip", "[count] TensorCores per chip: 1 on v5e/v6e, 2 on v7x"),
+)
+
+PLACEMENT_LABELS: tuple[LabelSpec, ...] = (
+    LabelSpec("engine", "[index] engine this rank belongs to"),
+    LabelSpec("rank", "[index] worker process within the engine, 0..world_size-1"),
+    LabelSpec("tp_rank", "[index] position in the tensor-parallel group"),
+    LabelSpec("pp_rank", "[index] pipeline stage"),
+    LabelSpec("pcp_rank", "[index] prefill-context group: which prompt chunk"),
+    LabelSpec(
+        "dcp_rank", "[index] decode-context group: which KV shard (reuses TP ranks)"
+    ),
+    LabelSpec("node_rank", "[index] host of the engine's slice, 0..nnodes-1"),
+    LabelSpec("device_id", "[index] logical device (core) in the runtime's numbering"),
+    LabelSpec(
+        "chip_index", "[index] physical chip, 0..visible_chips-1, in coords order"
+    ),
+    LabelSpec(
+        "core_on_chip", "[index] TensorCore within the chip: 0 on v5e/v6e, 0|1 on v7x"
+    ),
+    LabelSpec("chip_coords", "[x,y,z] position in the visible slice's ICI mesh"),
+    LabelSpec(
+        "host_visible_chips", "[id list] TPU_VISIBLE_CHIPS pin; '' if whole host"
+    ),
+    LabelSpec("layers", "[range] layers held by this pipeline stage"),
 )
 
 
