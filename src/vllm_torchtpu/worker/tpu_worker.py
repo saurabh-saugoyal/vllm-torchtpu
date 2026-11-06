@@ -839,6 +839,25 @@ class TPUWorker(WorkerBase):
         # allocator keeps their pages. Return them before initialize_from_config,
         # where a KV connector may allocate its host store.
         _release_free_host_heap()
+        self._placement = None
+        if envs.VLLM_TPU_EMIT_PLACEMENT:
+            from vllm_torchtpu.observability.placement_provider import (
+                describe_rank_placement,
+            )
+
+            # Static for the life of the process; read once the parallel
+            # groups exist and the sharded layers are built, served to the
+            # API server through get_placement().
+            self._placement = describe_rank_placement(
+                rank=self.rank,
+                data_parallel_rank=self.parallel_config.data_parallel_index,
+                node_rank=self.parallel_config.node_rank,
+                model=self.model_runner.model,
+            )
+
+    def get_placement(self) -> dict | None:
+        """This rank's placement for the API server (collective_rpc)."""
+        return self._placement.to_dict() if self._placement else None
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
