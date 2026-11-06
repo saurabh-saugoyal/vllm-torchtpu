@@ -134,15 +134,19 @@ of a deployment that no longer exists.
 # One series per engine (data-parallel rank).
 vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
   data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
-  decode_context_parallel_size="1", world_size="4", nnodes="1"} 1
+  decode_context_parallel_size="1", world_size="4", nnodes="1", device_kind="TPU v6e",
+  visible_chips="4", cores_per_chip="1"} 1
 
-# One series per rank: its position in each parallel group and the layers it holds.
+# One series per rank: where it runs and which layers it holds.
 vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0",
+  device_id="1", chip_index="1", core_on_chip="0", chip_coords="1,0,0", host_visible_chips="",
   layers="0-31"} 1
 ```
 
 | Label | Meaning |
 | :--- | :--- |
+| `host_visible_chips` | Host chips the process may use (`TPU_VISIBLE_CHIPS`), e.g. `4-7` for the second engine of `DP=2` on an 8-chip host; empty when the whole host is visible. Under multi-process DP the runtime renumbers `device_id`/`chip_index`/`chip_coords` within this subset, so this is what distinguishes engines physically. |
+| `device_id`, `chip_coords`, `core_on_chip`, `chip_index` | The logical TPU device the rank is pinned to, its ICI coordinates, and which TensorCore of which physical chip that is. On TPU v7x two ranks share a `chip_index`. |
 | `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
 | `node_rank` | Host of the engine's slice this rank runs on (`--nnodes` multi-host); `0` on single-host engines. |
 | `layers` | Transformer layers held by this pipeline stage (inclusive range). |

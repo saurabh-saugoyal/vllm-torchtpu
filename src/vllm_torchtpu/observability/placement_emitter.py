@@ -22,7 +22,7 @@ to the log once as a ``tpu_placement`` JSON line.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
@@ -33,6 +33,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.observability.placement_types import (
     PARALLEL_CONFIG_LABELS,
     PLACEMENT_LABELS,
+    DeviceIdentity,
     ParallelSummary,
     Range,
     RankPlacement,
@@ -51,7 +52,10 @@ PLACEMENT_METRIC = "vllm:tpu_placement_info"
 _gauges: dict[str, Gauge] = {}
 
 
-def parallel_summary(parallel_config: ParallelConfig) -> ParallelSummary:
+def parallel_summary(
+    parallel_config: ParallelConfig, placements: Sequence[RankPlacement]
+) -> ParallelSummary:
+    device = next((p.device for p in placements if p.device.device_kind), None)
     return ParallelSummary(
         tensor_parallel_size=parallel_config.tensor_parallel_size,
         pipeline_parallel_size=parallel_config.pipeline_parallel_size,
@@ -61,6 +65,9 @@ def parallel_summary(parallel_config: ParallelConfig) -> ParallelSummary:
         decode_context_parallel_size=parallel_config.decode_context_parallel_size,
         world_size=parallel_config.world_size,
         nnodes=parallel_config.nnodes,
+        device_kind=device.device_kind if device else None,
+        visible_chips=device.visible_chips if device else None,
+        cores_per_chip=device.cores_per_chip if device else None,
     )
 
 
@@ -72,11 +79,26 @@ def format_range(bounds: Range | None) -> str:
     return str(start) if stop - start == 1 else f"{start}-{stop - 1}"
 
 
+def format_ids(ids: Iterable[int] | None) -> str:
+    """``(0, 1, 2, 5, 9, 10)`` -> ``"0-2,5,9-10"``."""
+    if not ids:
+        return ""
+    ordered = sorted(ids)
+    runs: list[list[int]] = [[ordered[0], ordered[0]]]
+    for i in ordered[1:]:
+        if i == runs[-1][1] + 1:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+
+
 def _label(value: object) -> str:
     return "" if value is None else str(value)
 
 
 def placement_labels(placement: RankPlacement) -> dict[str, str]:
+    device = placement.device
     return {
         "engine": str(placement.dp_rank),
         "rank": str(placement.rank),
@@ -85,6 +107,13 @@ def placement_labels(placement: RankPlacement) -> dict[str, str]:
         "pcp_rank": _label(placement.pcp_rank),
         "dcp_rank": _label(placement.dcp_rank),
         "node_rank": str(placement.node_rank),
+        "device_id": _label(device.device_id),
+        "chip_index": _label(device.chip_index),
+        "core_on_chip": _label(device.core_on_chip),
+        "chip_coords": ",".join(map(str, device.chip_coords))
+        if device.chip_coords
+        else "",
+        "host_visible_chips": format_ids(device.host_visible_chips),
         "layers": format_range(placement.layers),
     }
 
@@ -125,8 +154,7 @@ def emit_prometheus(
             gauge.labels(**parallel_config_labels(summary, engine)).set(1)
     gauge = _gauge(
         PLACEMENT_METRIC,
-        "Parallel-group position of each rank and the layers it holds; "
-        "one series per rank",
+        "TPU device each rank runs on and the layers it holds; one series per rank",
         label_names(PLACEMENT_LABELS),
     )
     for placement in placements:
@@ -164,7 +192,10 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
     """collective_rpc may hand back the dataclass or its serialised dict."""
     if isinstance(row, RankPlacement):
         return row
-    return RankPlacement(**row)
+    return RankPlacement(
+        **{k: v for k, v in row.items() if k != "device"},
+        device=DeviceIdentity(**row["device"]),
+    )
 
 
 async def publish_placement(
@@ -177,7 +208,7 @@ async def publish_placement(
             await collect_rank_placements(engine_client),
             key=lambda p: (p.dp_rank, p.rank),
         )
-        summary = parallel_summary(vllm_config.parallel_config)
+        summary = parallel_summary(vllm_config.parallel_config, placements)
         emit_prometheus(summary, placements)
         emit_log(summary, placements)
         logger.info(

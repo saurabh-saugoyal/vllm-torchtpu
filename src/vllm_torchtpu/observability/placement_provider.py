@@ -14,17 +14,23 @@
 """Worker-side provider: describe the calling rank's placement.
 
 Runs once in each worker after the model is loaded. Reads vLLM's parallel
-groups and the pipeline stage's layer bounds. Nothing is computed from model
-names or config strings.
+groups, the pipeline stage's layer bounds and the device this process is
+pinned to. Nothing is computed from model names or config strings.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.observability.placement_types import Range, RankPlacement
+from vllm_torchtpu.observability.placement_types import (
+    DeviceIdentity,
+    Range,
+    RankPlacement,
+)
 
 logger = init_logger(__name__)
 
@@ -49,6 +55,7 @@ def describe_rank_placement(
             pcp_rank=None,
             dcp_rank=None,
             node_rank=node_rank,
+            device=DeviceIdentity(),
             error=str(error),
         )
 
@@ -67,6 +74,7 @@ def _describe(
         pcp_rank=_optional_group_rank("get_pcp_group"),
         dcp_rank=_optional_group_rank("get_dcp_group"),
         node_rank=node_rank,
+        device=describe_device(),
         layers=_pipeline_layer_range(model),
     )
 
@@ -77,6 +85,39 @@ def _optional_group_rank(getter_name: str) -> int | None:
     if getter is None:
         return None
     return getter().rank_in_group
+
+
+def describe_device() -> DeviceIdentity:
+    """The TPU core this process is pinned to, from JAX and ChipTopology."""
+    import jax
+
+    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
+    from vllm_torchtpu.distributed.mesh_utils import _get_tpu_global_device_id
+
+    pinned = os.environ.get("TPU_VISIBLE_CHIPS", "")
+    host_visible_chips = (
+        tuple(int(c) for c in pinned.split(",") if c.strip()) if pinned else None
+    )
+    device_id = int(_get_tpu_global_device_id())
+    device = next((d for d in jax.devices() if int(d.id) == device_id), None)
+    topology = get_chip_topology()
+    chip_index = None
+    if topology is not None:
+        chip_index = next(
+            (i for i, ids in enumerate(topology.chips) if device_id in ids), None
+        )
+    return DeviceIdentity(
+        device_id=device_id,
+        device_kind=device.device_kind if device is not None else None,
+        chip_coords=tuple(int(c) for c in device.coords)
+        if device is not None
+        else None,
+        core_on_chip=int(device.core_on_chip) if device is not None else None,
+        chip_index=chip_index,
+        visible_chips=topology.num_chips if topology is not None else None,
+        cores_per_chip=topology.cores_per_chip if topology is not None else None,
+        host_visible_chips=host_visible_chips,
+    )
 
 
 def _pipeline_layer_range(model: torch.nn.Module) -> Range | None:
