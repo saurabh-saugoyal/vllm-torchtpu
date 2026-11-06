@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Typed records describing where a rank runs.
+"""Typed records describing where a rank runs and which slice of a model it holds.
 
 Vocabulary: a *slice* is every chip the engine's workers can see; a *chip* sits
 at ``chip_coords`` in the ICI mesh and holds ``cores_per_chip`` TensorCores; one
@@ -45,6 +45,39 @@ class DeviceIdentity:
 
 
 @dataclass(frozen=True)
+class AttentionSharding:
+    """Heads one tensor-parallel rank computes in an attention layer."""
+
+    q_heads: Range
+    kv_heads: Range
+    kv_replicated: bool
+    total_q_heads: int
+    total_kv_heads: int
+    gqa_padded: bool = False
+
+
+@dataclass(frozen=True)
+class MlpSharding:
+    """Columns of the dense MLP intermediate dim one rank holds."""
+
+    intermediate: Range
+    total_intermediate: int
+
+
+@dataclass(frozen=True)
+class LayerGroup:
+    """Layers of one root module that shard identically on this rank."""
+
+    root: str
+    layers: tuple[int, ...]
+    attn: AttentionSharding | None = None
+    mlp: MlpSharding | None = None
+
+    def sharding_key(self) -> tuple:
+        return (self.root, self.attn, self.mlp)
+
+
+@dataclass(frozen=True)
 class RankPlacement:
     """Everything one worker rank reports; serialisable with :func:`asdict`."""
 
@@ -59,6 +92,7 @@ class RankPlacement:
     node_rank: int
     device: DeviceIdentity
     layers: Range | None = None
+    layer_groups: tuple[LayerGroup, ...] = ()
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -135,6 +169,15 @@ PLACEMENT_LABELS: tuple[LabelSpec, ...] = (
         "host_visible_chips", "[id list] TPU_VISIBLE_CHIPS pin; '' if whole host"
     ),
     LabelSpec("layers", "[range] layers held by this pipeline stage"),
+    LabelSpec("module", "[text] root module of the layers, e.g. 'model', 'visual'"),
+    LabelSpec("layer_subset", "[id list] layers of `module` sharing this sharding"),
+    LabelSpec("q_heads", "[range] query heads this rank computes"),
+    LabelSpec("kv_heads", "[range] KV heads this rank holds; one head when replicated"),
+    LabelSpec(
+        "kv_replicated", "[bool] num_kv_heads < TP: a KV head is shared by ranks"
+    ),
+    LabelSpec("gqa_padded", "[bool] Q heads zero-padded to divide by TP"),
+    LabelSpec("mlp_intermediate", "[range] dense MLP intermediate slab on this rank"),
 )
 
 

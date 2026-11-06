@@ -28,13 +28,27 @@ from vllm_torchtpu.observability import placement_emitter as emitter
 from vllm_torchtpu.observability.placement_types import (
     PARALLEL_CONFIG_LABELS,
     PLACEMENT_LABELS,
+    AttentionSharding,
     DeviceIdentity,
+    LayerGroup,
+    MlpSharding,
     RankPlacement,
     label_names,
 )
 
 
-def placement(rank, dp_rank=0, **overrides) -> RankPlacement:
+def placement(rank, dp_rank=0, groups=None, **overrides) -> RankPlacement:
+    if groups is None:
+        groups = (
+            LayerGroup(
+                root="model",
+                layers=tuple(range(32)),
+                attn=AttentionSharding(
+                    (rank * 8, rank * 8 + 8), (rank * 2, rank * 2 + 2), False, 32, 8
+                ),
+                mlp=MlpSharding((rank * 3584, rank * 3584 + 3584), 14336),
+            ),
+        )
     base = dict(
         rank=rank,
         dp_rank=dp_rank,
@@ -47,6 +61,7 @@ def placement(rank, dp_rank=0, **overrides) -> RankPlacement:
         node_rank=0,
         device=DeviceIdentity(rank, "TPU v6e", (rank, 0, 0), 0, rank, 4, 1, None),
         layers=(0, 32),
+        layer_groups=groups,
     )
     base.update(overrides)
     return RankPlacement(**base)
@@ -91,14 +106,21 @@ def test_parallel_config_labels_exact():
 
 
 def test_placement_labels_exact():
+    group = LayerGroup(
+        "model",
+        tuple(range(32)),
+        attn=AttentionSharding((8, 16), (2, 4), False, 32, 8),
+        mlp=MlpSharding((3584, 7168), 14336),
+    )
     p = placement(
         1,
+        groups=(group,),
         pcp_rank=0,
         dcp_rank=1,
         node_rank=1,
         device=DeviceIdentity(1, "TPU v6e", (1, 0, 0), 0, 1, 4, 1, (4, 5, 6, 7)),
     )
-    labels = emitter.placement_labels(p)
+    labels = emitter.placement_labels(p, group)
     assert labels == {
         "engine": "0",
         "rank": "1",
@@ -113,14 +135,45 @@ def test_placement_labels_exact():
         "chip_coords": "1,0,0",
         "host_visible_chips": "4-7",
         "layers": "0-31",
+        "module": "model",
+        "layer_subset": "0-31",
+        "q_heads": "8-15",
+        "kv_heads": "2-3",
+        "kv_replicated": "False",
+        "gqa_padded": "False",
+        "mlp_intermediate": "3584-7167",
     }
     assert list(labels) == label_names(PLACEMENT_LABELS)
 
 
-def test_labels_without_device():
-    labels = emitter.placement_labels(placement(2, device=DeviceIdentity()))
-    assert labels["rank"] == "2" and labels["chip_coords"] == ""
-    assert labels["host_visible_chips"] == ""
+def test_labels_without_groups_or_device():
+    labels = emitter.placement_series(placement(2, groups=(), device=DeviceIdentity()))[
+        0
+    ]
+    assert (
+        labels["rank"] == "2"
+        and labels["q_heads"] == ""
+        and labels["chip_coords"] == ""
+    )
+
+
+def test_one_series_per_layer_group():
+    groups = (
+        LayerGroup(
+            "model", (0, 2), attn=AttentionSharding((8, 16), (0, 1), True, 16, 2)
+        ),
+        LayerGroup("model", (1, 3)),
+        LayerGroup(
+            "visual", (0,), attn=AttentionSharding((0, 8), (0, 8), False, 16, 16)
+        ),
+    )
+    series = emitter.placement_series(placement(1, groups=groups))
+    assert [(s["module"], s["layer_subset"]) for s in series] == [
+        ("model", "0,2"),
+        ("model", "1,3"),
+        ("visual", "0"),
+    ]
+    assert series[0]["kv_heads"] == "0" and series[1]["q_heads"] == ""
 
 
 @pytest.mark.parametrize("bounds,text", [(None, ""), ((3, 4), "3"), ((8, 16), "8-15")])
@@ -168,7 +221,7 @@ def series(reg, name):
     }
 
 
-def test_emit_prometheus_one_series_per_rank_and_engine(registry):
+def test_emit_prometheus_one_series_per_rank_group_and_engine(registry):
     ps = [placement(0), placement(1), placement(0, dp_rank=1), placement(1, dp_rank=1)]
     emitter.emit_prometheus(
         emitter.parallel_summary(parallel_config(data_parallel_size=2), ps), ps
@@ -213,7 +266,7 @@ def test_emit_log_is_one_json_line(caplog):
     ]
     payload = json.loads(lines[0].split(" ", 1)[1])
     assert payload["parallel"]["tensor_parallel_size"] == 4
-    assert payload["ranks"][0]["device"]["device_kind"] == "TPU v6e"
+    assert payload["ranks"][0]["layer_groups"][0]["attn"]["q_heads"] == [0, 8]
 
 
 # --------------------------------------------------------------- collection
@@ -242,7 +295,7 @@ def test_collect_uses_all_engines():
     )
     assert [(p.dp_rank, p.rank) for p in got] == [(0, 0), (0, 1), (1, 0)]
     assert core.fan_out_calls == [("collective_rpc", "get_placement", None, (), {})]
-    assert isinstance(got[0].device, DeviceIdentity)
+    assert isinstance(got[0].layer_groups[0].attn, AttentionSharding)
 
 
 def test_collect_falls_back_to_collective_rpc():

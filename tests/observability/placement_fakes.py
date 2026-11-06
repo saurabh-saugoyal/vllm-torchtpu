@@ -13,8 +13,9 @@
 # limitations under the License.
 """Shared fakes for the placement tests.
 
-A minimal model with ``model.layers`` and pipeline bounds, a stand-in for
-vLLM's parallel state, and a no-op device probe.
+Layer stand-ins subclass the real vLLM classes so ``isinstance`` dispatch in
+the provider is exercised against the true types; ``__init__`` is bypassed
+and every attribute the provider reads is set explicitly.
 """
 
 from __future__ import annotations
@@ -22,20 +23,89 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 
 from vllm_torchtpu.observability.placement_types import DeviceIdentity
 
 
-class DenseLayer(torch.nn.Module):
-    """One transformer block as far as the provider reads it."""
+def _bare(cls: type, **attrs) -> torch.nn.Module:
+    obj = cls.__new__(cls)
+    torch.nn.Module.__init__(obj)
+    for name, value in attrs.items():
+        object.__setattr__(obj, name, value)
+    return obj
 
-    def __init__(self, tp_size, **_):
+
+def attention(num_heads: int, num_kv_heads: int) -> Attention:
+    """Per-rank head counts, as vLLM passes them to ``Attention``."""
+    return _bare(Attention, num_heads=num_heads, num_kv_heads=num_kv_heads)
+
+
+def qkv_proj(total_heads: int, total_kv_heads: int, tp_size: int) -> QKVParallelLinear:
+    replicas = tp_size // total_kv_heads if tp_size > total_kv_heads else 1
+    return _bare(
+        QKVParallelLinear,
+        total_num_heads=total_heads,
+        total_num_kv_heads=total_kv_heads,
+        num_heads=total_heads // tp_size,
+        num_kv_heads=max(1, total_kv_heads // tp_size),
+        num_kv_head_replicas=replicas,
+    )
+
+
+def down_proj(intermediate: int, tp_size: int) -> RowParallelLinear:
+    return _bare(
+        RowParallelLinear,
+        input_size=intermediate,
+        input_size_per_partition=intermediate // tp_size,
+    )
+
+
+class GatedDeltaNet(torch.nn.Module, MambaBase):
+    """Linear-attention layer as the provider sees it: ``MambaBase`` with
+    per-rank state shapes (vLLM's GDN splits value heads over TP)."""
+
+    def __init__(self, num_v_heads, tp_size, head_dim=128, conv_dim=512):
         super().__init__()
-        self.tp_size = tp_size
+        self._shapes = (
+            (conv_dim // tp_size, 4),
+            (num_v_heads // tp_size, head_dim, head_dim),
+        )
+
+    def get_state_shape(self):
+        return self._shapes
+
+    @property
+    def mamba_type(self):
+        return SimpleNamespace(name="GDN")  # the backend enum member, as read
+
+    def get_state_dtype(self):
+        return (torch.bfloat16, torch.float32)
+
+
+class AttentionBlock(torch.nn.Module):
+    """Owner of ``attn`` and ``qkv_proj`` (vLLM's ``LlamaAttention`` shape)."""
+
+    def __init__(self, total_heads, total_kv_heads, tp_size, orig_total_heads=None):
+        super().__init__()
+        self.qkv_proj = qkv_proj(total_heads, total_kv_heads, tp_size)
+        self.attn = attention(self.qkv_proj.num_heads, self.qkv_proj.num_kv_heads)
+        if orig_total_heads is not None:
+            self.orig_total_num_heads = orig_total_heads
+
+
+class DenseLayer(torch.nn.Module):
+    def __init__(self, tp_size, heads=32, kv_heads=8, intermediate=14336):
+        super().__init__()
+        self.self_attn = AttentionBlock(heads, kv_heads, tp_size)
+        self.mlp = torch.nn.Module()
+        self.mlp.down_proj = down_proj(intermediate, tp_size)
 
 
 class FakeModel(torch.nn.Module):
-    """``model.layers.<i>`` plus the pipeline stage's ``start_layer``/``end_layer``."""
+    """``model.layers.<i>`` plus optional extra roots (vision tower, draft)."""
 
     def __init__(self, layers: list[torch.nn.Module], start_layer=0, end_layer=None):
         super().__init__()

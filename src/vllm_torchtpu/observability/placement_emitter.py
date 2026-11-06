@@ -15,8 +15,8 @@
 
 Two gauges, value ``1`` with the facts in the labels (the
 ``vllm:cache_config_info`` idiom): ``vllm:parallel_config_info`` once per
-engine and ``vllm:tpu_placement_info`` once per rank. The same payload goes
-to the log once as a ``tpu_placement`` JSON line.
+engine and ``vllm:tpu_placement_info`` once per rank and layer subset. The
+same payload goes to the log once as a ``tpu_placement`` JSON line.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.observability.placement_types import (
     PARALLEL_CONFIG_LABELS,
     PLACEMENT_LABELS,
-    DeviceIdentity,
+    LayerGroup,
     ParallelSummary,
     Range,
     RankPlacement,
@@ -97,8 +97,12 @@ def _label(value: object) -> str:
     return "" if value is None else str(value)
 
 
-def placement_labels(placement: RankPlacement) -> dict[str, str]:
+def placement_labels(
+    placement: RankPlacement, group: LayerGroup | None
+) -> dict[str, str]:
     device = placement.device
+    attn = group.attn if group else None
+    mlp = group.mlp if group else None
     return {
         "engine": str(placement.dp_rank),
         "rank": str(placement.rank),
@@ -115,7 +119,20 @@ def placement_labels(placement: RankPlacement) -> dict[str, str]:
         else "",
         "host_visible_chips": format_ids(device.host_visible_chips),
         "layers": format_range(placement.layers),
+        "module": group.root if group else "",
+        "layer_subset": format_ids(group.layers) if group else "",
+        "q_heads": format_range(attn.q_heads) if attn else "",
+        "kv_heads": format_range(attn.kv_heads) if attn else "",
+        "kv_replicated": _label(attn.kv_replicated) if attn else "",
+        "gqa_padded": _label(attn.gqa_padded) if attn else "",
+        "mlp_intermediate": format_range(mlp.intermediate) if mlp else "",
     }
+
+
+def placement_series(placement: RankPlacement) -> list[dict[str, str]]:
+    """One label set per layer group; at least one so the rank is visible."""
+    groups: Sequence[LayerGroup | None] = placement.layer_groups or (None,)
+    return [placement_labels(placement, group) for group in groups]
 
 
 def parallel_config_labels(summary: ParallelSummary, engine: int) -> dict[str, str]:
@@ -154,11 +171,13 @@ def emit_prometheus(
             gauge.labels(**parallel_config_labels(summary, engine)).set(1)
     gauge = _gauge(
         PLACEMENT_METRIC,
-        "TPU device each rank runs on and the layers it holds; one series per rank",
+        "TPU device each rank runs on and the heads and layers it holds; "
+        "one series per rank and layer subset",
         label_names(PLACEMENT_LABELS),
     )
     for placement in placements:
-        gauge.labels(**placement_labels(placement)).set(1)
+        for labels in placement_series(placement):
+            gauge.labels(**labels).set(1)
 
 
 def emit_log(summary: ParallelSummary, placements: Sequence[RankPlacement]) -> None:
@@ -192,9 +211,24 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
     """collective_rpc may hand back the dataclass or its serialised dict."""
     if isinstance(row, RankPlacement):
         return row
+    from vllm_torchtpu.observability.placement_types import (
+        AttentionSharding,
+        DeviceIdentity,
+        MlpSharding,
+    )
+
+    def group(g: dict) -> LayerGroup:
+        return LayerGroup(
+            root=g["root"],
+            layers=tuple(g["layers"]),
+            attn=AttentionSharding(**g["attn"]) if g["attn"] else None,
+            mlp=MlpSharding(**g["mlp"]) if g["mlp"] else None,
+        )
+
     return RankPlacement(
-        **{k: v for k, v in row.items() if k != "device"},
+        **{k: v for k, v in row.items() if k not in ("device", "layer_groups")},
         device=DeviceIdentity(**row["device"]),
+        layer_groups=tuple(group(g) for g in row["layer_groups"]),
     )
 
 

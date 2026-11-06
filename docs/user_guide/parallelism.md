@@ -134,13 +134,17 @@ of a deployment that no longer exists.
 # One series per engine (data-parallel rank).
 vllm:parallel_config_info{engine="0", tensor_parallel_size="4", pipeline_parallel_size="1",
   data_parallel_size="1", enable_expert_parallel="False", prefill_context_parallel_size="1",
-  decode_context_parallel_size="1", world_size="4", nnodes="1", device_kind="TPU v6e",
+  decode_context_parallel_size="1", world_size="4", device_kind="TPU v6e",
   visible_chips="4", cores_per_chip="1"} 1
 
-# One series per rank: where it runs and which layers it holds.
+# One series per rank and layer group: where it runs and which slice of the
+# model it holds. A homogeneous model has one group per rank; a hybrid model
+# (e.g. alternating full/linear attention) has one
+# series per distinct layer type, identified by `layer_subset`.
 vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank="0", dcp_rank="0", node_rank="0",
   device_id="1", chip_index="1", core_on_chip="0", chip_coords="1,0,0", host_visible_chips="",
-  layers="0-31"} 1
+  layers="0-31", module="model", layer_subset="0-31", q_heads="8-15", kv_heads="2-3", kv_replicated="False",
+  gqa_padded="False", mlp_intermediate="3584-7167"} 1
 ```
 
 | Label | Meaning |
@@ -150,6 +154,9 @@ vllm:tpu_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_rank
 | `pcp_rank`, `dcp_rank` | Position in the prefill-context-parallel group (which chunk of a long prompt's tokens this rank processes) and in the decode-context-parallel group (which shard of the KV cache it attends over; DCP reuses TP ranks). |
 | `node_rank` | Host of the engine's slice this rank runs on (`--nnodes` multi-host); `0` on single-host engines. |
 | `layers` | Transformer layers held by this pipeline stage (inclusive range). |
+| `module`, `layer_subset` | The root module (`model`, `visual`, `draft`, ...) and the subset of its layers whose sharding this series describes, e.g. `0-27` or `1,3,5-7`. Layers with identical attention/MLP sharding are merged, so homogeneous models have one series per rank; a vision tower or draft model never merges with the language model. |
+| `q_heads`, `kv_heads` | Attention heads this tensor-parallel rank computes (inclusive ranges, from `QKVParallelLinear`). `kv_replicated="True"` means `num_kv_heads < tp_size` and the single KV head is shared by several ranks. `gqa_padded="True"` means the Q-head count was zero-padded to divide by TP, so the range is in padded head indices. |
+| `mlp_intermediate` | Columns of the dense MLP intermediate dimension this rank holds (its `gate_proj`/`up_proj` rows and `down_proj` columns). |
 
 The same payload is also written once to the server log as a single JSON line
 prefixed `tpu_placement`, for installations without a metrics scraper.
