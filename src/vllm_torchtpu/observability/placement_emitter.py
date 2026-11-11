@@ -124,9 +124,19 @@ def rank_labels(placement: RankPlacement) -> dict[str, str]:
     }
 
 
+# Cloud Monitoring rejects label values above this; a longer expert list is
+# dropped and ``local_expert_count`` keeps the size.
+MAX_LABEL_BYTES = 1024
+
+
+def _bounded(value: str) -> str:
+    return value if len(value.encode()) <= MAX_LABEL_BYTES else ""
+
+
 def layer_labels(placement: RankPlacement, group: LayerGroup) -> dict[str, str]:
     """Per-layer-group facts: which slice of these layers the rank holds."""
-    attn, linear = group.attn, group.linear_attn
+    attn, linear, mlp = group.attn, group.linear_attn, group.mlp
+    moe, shared, vocab = group.moe, group.shared_mlp, group.vocab
     return {
         "engine": str(placement.dp_rank),
         "rank": str(placement.rank),
@@ -144,6 +154,19 @@ def layer_labels(placement: RankPlacement, group: LayerGroup) -> dict[str, str]:
         else "",
         "linear_state_elements": str(sum(math.prod(s) for s in linear.state_shapes))
         if linear
+        else "",
+        "mlp_intermediate": format_range(mlp.intermediate) if mlp else "",
+        "vocab_rows": format_range(vocab.rows) if vocab else "",
+        "ep_rank": _label(moe.ep_rank) if moe else "",
+        "ep_size": _label(moe.ep_size) if moe else "",
+        "moe_tp_rank": _label(moe.tp_rank) if moe else "",
+        "moe_tp_size": _label(moe.tp_size) if moe else "",
+        "expert_placement": moe.placement if moe else "",
+        "total_experts": _label(moe.global_num_experts) if moe else "",
+        "local_expert_count": str(len(moe.local_experts)) if moe else "",
+        "local_experts": _bounded(format_ids(moe.local_experts)) if moe else "",
+        "shared_expert_intermediate": format_range(shared.intermediate)
+        if shared
         else "",
     }
 
@@ -234,6 +257,9 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
         AttentionSharding,
         DeviceIdentity,
         LinearAttentionSharding,
+        MlpSharding,
+        MoeSharding,
+        VocabSharding,
     )
 
     def _attention(a: dict) -> AttentionSharding:
@@ -256,6 +282,10 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
             linear_attn=LinearAttentionSharding(**g["linear_attn"])
             if g["linear_attn"]
             else None,
+            mlp=MlpSharding(**g["mlp"]) if g["mlp"] else None,
+            moe=MoeSharding(**g["moe"]) if g["moe"] else None,
+            shared_mlp=MlpSharding(**g["shared_mlp"]) if g["shared_mlp"] else None,
+            vocab=VocabSharding(**g["vocab"]) if g["vocab"] else None,
         )
 
     return RankPlacement(

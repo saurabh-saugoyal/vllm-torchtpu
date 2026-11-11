@@ -27,8 +27,10 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )
-from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.v1.attention.backend import AttentionType
 
 from vllm_torchtpu.observability.placement_types import DeviceIdentity
@@ -80,6 +82,14 @@ def qkv_proj(total_heads: int, total_kv_heads: int, tp_size: int) -> QKVParallel
     )
 
 
+def down_proj(intermediate: int, tp_size: int) -> RowParallelLinear:
+    return _bare(
+        RowParallelLinear,
+        input_size=intermediate,
+        input_size_per_partition=intermediate // tp_size,
+    )
+
+
 class GatedDeltaNet(torch.nn.Module, MambaBase):
     """Linear-attention layer as the provider sees it: ``MambaBase`` with
     per-rank state shapes (vLLM's GDN splits value heads over TP)."""
@@ -104,6 +114,64 @@ class GatedDeltaNet(torch.nn.Module, MambaBase):
         return (torch.bfloat16, torch.float32)
 
 
+class MoeBlock(torch.nn.Module):
+    """vLLM's ``Qwen2MoeSparseMoeBlock`` shape: routed experts + fused shared expert."""
+
+    def __init__(self, global_experts, ep_rank, ep_size, tp_size, shared_intermediate):
+        super().__init__()
+        self.experts = routed_experts(global_experts, ep_rank, ep_size)
+        self.shared_expert = torch.nn.Module()
+        self.shared_expert.down_proj = down_proj(shared_intermediate, tp_size)
+
+
+def routed_experts(
+    global_experts: int,
+    ep_rank: int,
+    ep_size: int,
+    moe_tp: tuple[int, int] = (0, 1),
+    enable_eplb: bool = False,
+    local_ids: list[int] | None = None,
+) -> RoutedExperts:
+    """``expert_map`` as vLLM builds it: global id -> local slot, -1 if not
+    resident, ``None`` without EP. ``local_ids`` overrides the default
+    contiguous block (round-robin or uneven placements)."""
+    per = global_experts // ep_size
+    expert_map = None
+    if ep_size > 1:
+        local = (
+            local_ids
+            if local_ids is not None
+            else range(ep_rank * per, (ep_rank + 1) * per)
+        )
+        expert_map = torch.full((global_experts,), -1, dtype=torch.int32)
+        expert_map[list(local)] = torch.arange(len(local), dtype=torch.int32)
+    return _bare(
+        RoutedExperts,
+        global_num_experts=global_experts,
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                tp_rank=moe_tp[0],
+                tp_size=moe_tp[1],
+                enable_eplb=enable_eplb,
+            )
+        ),
+        expert_map_manager=SimpleNamespace(expert_map=expert_map),
+    )
+
+
+def lm_head(vocab: int, tp_rank: int, tp_size: int) -> ParallelLMHead:
+    per = vocab // tp_size
+    return _bare(
+        ParallelLMHead,
+        org_vocab_size=vocab,
+        shard_indices=SimpleNamespace(
+            org_vocab_start_index=tp_rank * per, org_vocab_end_index=(tp_rank + 1) * per
+        ),
+    )
+
+
 class AttentionBlock(torch.nn.Module):
     """Owner of ``attn`` and ``qkv_proj`` (vLLM's ``LlamaAttention`` shape)."""
 
@@ -117,9 +185,13 @@ class AttentionBlock(torch.nn.Module):
 
 
 class DenseLayer(torch.nn.Module):
-    def __init__(self, tp_size, heads=32, kv_heads=8, encoder=False):
+    def __init__(
+        self, tp_size, heads=32, kv_heads=8, intermediate=14336, encoder=False
+    ):
         super().__init__()
         self.self_attn = AttentionBlock(heads, kv_heads, tp_size, encoder=encoder)
+        self.mlp = torch.nn.Module()
+        self.mlp.down_proj = down_proj(intermediate, tp_size)
 
 
 class FakeModel(torch.nn.Module):

@@ -34,7 +34,10 @@ from vllm_torchtpu.observability.placement_types import (
     DeviceIdentity,
     LayerGroup,
     LinearAttentionSharding,
+    MlpSharding,
+    MoeSharding,
     RankPlacement,
+    VocabSharding,
     label_names,
 )
 
@@ -53,6 +56,7 @@ def placement(rank, dp_rank=0, groups=None, **overrides) -> RankPlacement:
                     32,
                     8,
                 ),
+                mlp=MlpSharding((rank * 3584, rank * 3584 + 3584), 14336),
             ),
         )
     base = dict(
@@ -116,6 +120,9 @@ def test_placement_labels_exact():
         "model",
         tuple(range(32)),
         attn=AttentionSharding("full", (8, 16), (2, 4), False, 32, 8),
+        mlp=MlpSharding((3584, 7168), 14336),
+        moe=MoeSharding(1, 8, 0, 1, 60, (0, 1, 2, 5, 6, 9)),
+        shared_mlp=MlpSharding((1408, 2816), 5632),
     )
     p = placement(
         1,
@@ -155,6 +162,17 @@ def test_placement_labels_exact():
         "kv_token_shard": "",
         "linear_state": "",
         "linear_state_elements": "",
+        "mlp_intermediate": "3584-7167",
+        "vocab_rows": "",
+        "ep_rank": "1",
+        "ep_size": "8",
+        "moe_tp_rank": "0",
+        "moe_tp_size": "1",
+        "expert_placement": "static",
+        "total_experts": "60",
+        "local_expert_count": "6",
+        "local_experts": "0-2,5-6,9",
+        "shared_expert_intermediate": "1408-2815",
     }
     assert list(layer) == label_names(LAYER_LABELS)
 
@@ -167,21 +185,48 @@ def test_rank_labels_without_device():
 def test_layer_labels_blank_for_kinds_not_present():
     labels = emitter.layer_labels(placement(1), LayerGroup("model", (1, 3)))
     assert labels["attention_kind"] == "" and labels["q_heads"] == ""
-    assert labels["linear_state"] == ""
+    assert labels["linear_state"] == "" and labels["local_experts"] == ""
 
 
-def test_layer_labels_for_linear_attention():
+def test_layer_labels_for_linear_attention_and_experts():
     group = LayerGroup(
         "model",
         (0, 1, 2),
         linear_attn=LinearAttentionSharding(
             "GDN_ATTN", ((3, 1, 2048), (8, 128, 128)), False
         ),
+        moe=MoeSharding(1, 2, 0, 1, 64, tuple(range(32, 64))),
     )
     labels = emitter.layer_labels(placement(1), group)
     assert labels["attention_kind"] == "GDN_ATTN" and labels["q_heads"] == ""
     assert labels["linear_state"] == "3x1x2048|8x128x128"
     assert labels["linear_state_elements"] == str(3 * 2048 + 8 * 128 * 128)
+    assert labels["total_experts"] == "64" and labels["local_experts"] == "32-63"
+    assert labels["local_expert_count"] == "32" and labels["ep_size"] == "2"
+
+
+def test_layer_labels_eplb_cap_dcp_and_vocab():
+    eplb = LayerGroup("model", (0,), moe=MoeSharding(0, 2, 0, 1, 64, (), "eplb"))
+    labels = emitter.layer_labels(placement(0), eplb)
+    assert labels["expert_placement"] == "eplb" and labels["local_experts"] == ""
+    assert labels["local_expert_count"] == "0"
+
+    huge = LayerGroup(
+        "model", (0,), moe=MoeSharding(0, 2, 0, 1, 4096, tuple(range(0, 4096, 2)))
+    )
+    labels = emitter.layer_labels(placement(0), huge)
+    assert labels["local_experts"] == "" and labels["local_expert_count"] == "2048"
+
+    dcp = LayerGroup(
+        "model",
+        (0,),
+        attn=AttentionSharding("full", (0, 8), (0, 2), False, 8, 2, (1, 2)),
+    )
+    assert emitter.layer_labels(placement(0), dcp)["kv_token_shard"] == "1/2"
+
+    head = LayerGroup("lm_head", (), vocab=VocabSharding((0, 37984), 151936))
+    labels = emitter.layer_labels(placement(0), head)
+    assert labels["vocab_rows"] == "0-37983" and labels["layer_subset"] == ""
 
 
 def test_one_layer_row_per_group():
@@ -212,12 +257,6 @@ def test_one_layer_row_per_group():
         ("visual", "0"),
     ]
     assert series[0]["kv_heads"] == "0" and series[1]["attention_kind"] == "GDN_ATTN"
-
-
-def test_layer_labels_dcp_token_shard():
-    sharded = AttentionSharding("full", (0, 8), (0, 2), False, 8, 2, (1, 2))
-    dcp = LayerGroup("model", (0,), attn=sharded)
-    assert emitter.layer_labels(placement(0), dcp)["kv_token_shard"] == "1/2"
 
 
 @pytest.mark.parametrize("bounds,text", [(None, ""), ((3, 4), "3"), ((8, 16), "8-15")])
@@ -272,7 +311,7 @@ def test_emit_prometheus_one_rank_row_and_one_layer_row_per_group(registry):
             (0, 2),
             attn=AttentionSharding("full", (0, 8), (0, 2), False, 16, 4),
         ),
-        LayerGroup("model", (1, 3)),
+        LayerGroup("model", (1, 3), mlp=MlpSharding((0, 4096), 8192)),
     )
     ps = [
         placement(0),
@@ -350,7 +389,7 @@ def test_emit_log_is_one_json_line(caplog):
     ]
     payload = json.loads(lines[0].split(" ", 1)[1])
     assert payload["parallel"]["tensor_parallel_size"] == 4
-    assert payload["ranks"][0]["layer_groups"][0]["attn"]["q_heads"] == [0, 8]
+    assert payload["ranks"][0]["layer_groups"][0]["mlp"]["intermediate"] == [0, 3584]
 
 
 # --------------------------------------------------------------- collection

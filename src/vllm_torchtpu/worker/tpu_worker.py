@@ -851,6 +851,7 @@ class TPUWorker(WorkerBase):
                 data_parallel_rank=self.parallel_config.data_parallel_index,
                 node_rank=self.parallel_config.node_rank,
                 model=self.model_runner.model,
+                draft_model=getattr(self.model_runner.drafter, "draft_model", None),
             )
 
     def get_placement(self) -> dict | None:

@@ -74,6 +74,38 @@ class LinearAttentionSharding:
 
 
 @dataclass(frozen=True)
+class MlpSharding:
+    """Columns of the dense MLP intermediate dim one rank holds."""
+
+    intermediate: Range
+    total_intermediate: int
+
+
+@dataclass(frozen=True)
+class MoeSharding:
+    """Routed experts resident on one rank, and the MoE layer's own parallel
+    split (EP = TP x DP x PCP; MoE-TP can differ from attention TP). Under
+    EPLB the expert map changes at runtime, so ``local_experts`` is left
+    empty rather than reporting a load-time map."""
+
+    ep_rank: int
+    ep_size: int
+    tp_rank: int
+    tp_size: int
+    global_num_experts: int
+    local_experts: tuple[int, ...]
+    placement: str = "static"
+
+
+@dataclass(frozen=True)
+class VocabSharding:
+    """Rows of the vocabulary projection (``lm_head``) one rank holds."""
+
+    rows: Range
+    total_rows: int
+
+
+@dataclass(frozen=True)
 class LayerGroup:
     """Layers of one root module that shard identically on this rank."""
 
@@ -81,9 +113,22 @@ class LayerGroup:
     layers: tuple[int, ...]
     attn: AttentionSharding | None = None
     linear_attn: LinearAttentionSharding | None = None
+    mlp: MlpSharding | None = None
+    moe: MoeSharding | None = None
+    shared_mlp: MlpSharding | None = None
+    """The MoE block's always-on shared expert(s), fused into one dense MLP."""
+    vocab: VocabSharding | None = None
 
     def sharding_key(self) -> tuple:
-        return (self.root, self.attn, self.linear_attn)
+        return (
+            self.root,
+            self.attn,
+            self.linear_attn,
+            self.mlp,
+            self.moe,
+            self.shared_mlp,
+            self.vocab,
+        )
 
 
 @dataclass(frozen=True)
@@ -185,7 +230,7 @@ LAYER_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec("rank", "[index] worker process within the engine"),
     LabelSpec(
         "module",
-        "[text] root module of the layers, e.g. 'model', 'visual'",
+        "[text] root module of the layers: 'model', 'visual', 'draft', 'lm_head'",
     ),
     LabelSpec("layer_subset", "[id list] layers of `module` sharing this sharding"),
     LabelSpec(
@@ -203,6 +248,23 @@ LAYER_LABELS: tuple[LabelSpec, ...] = (
         "linear_state", "[shapes] per-rank recurrent state, e.g. '3x1x2048|8x128x128'"
     ),
     LabelSpec("linear_state_elements", "[count] elements of that state per rank"),
+    LabelSpec("mlp_intermediate", "[range] dense MLP intermediate slab on this rank"),
+    LabelSpec("vocab_rows", "[range] vocabulary rows of lm_head on this rank"),
+    LabelSpec("ep_rank", "[index] expert-parallel rank of the MoE layer"),
+    LabelSpec("ep_size", "[count] expert-parallel size = TP x DP x PCP"),
+    LabelSpec("moe_tp_rank", "[index] MoE tensor-parallel rank (hierarchical MoE)"),
+    LabelSpec("moe_tp_size", "[count] MoE tensor-parallel size"),
+    LabelSpec("expert_placement", "[text] 'static' or 'eplb' (rebalanced at runtime)"),
+    LabelSpec("total_experts", "[count] routed experts in the layer"),
+    LabelSpec("local_expert_count", "[count] routed experts resident on this rank"),
+    LabelSpec(
+        "local_experts",
+        "[id list] resident routed experts; '' under eplb or beyond 1024 bytes",
+    ),
+    LabelSpec(
+        "shared_expert_intermediate",
+        "[range] intermediate slab of the MoE block's fused shared expert(s)",
+    ),
 )
 
 
