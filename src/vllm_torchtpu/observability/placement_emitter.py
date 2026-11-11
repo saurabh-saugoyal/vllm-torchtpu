@@ -24,6 +24,7 @@ sharded layers. The same payload goes to the log once as a
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict
 from typing import TYPE_CHECKING
@@ -125,16 +126,25 @@ def rank_labels(placement: RankPlacement) -> dict[str, str]:
 
 def layer_labels(placement: RankPlacement, group: LayerGroup) -> dict[str, str]:
     """Per-layer-group facts: which slice of these layers the rank holds."""
-    attn = group.attn
+    attn, linear = group.attn, group.linear_attn
     return {
         "engine": str(placement.dp_rank),
         "rank": str(placement.rank),
         "module": group.root,
         "layer_subset": format_ids(group.layers),
-        "attention_kind": attn.kind if attn else "",
+        "attention_kind": attn.kind if attn else linear.kind if linear else "",
         "q_heads": format_range(attn.q_heads) if attn else "",
         "kv_heads": format_range(attn.kv_heads) if attn else "",
         "kv_replicated": _label(attn.kv_replicated) if attn else "",
+        "kv_token_shard": "{}/{}".format(*attn.kv_token_shard)
+        if attn and attn.kv_token_shard
+        else "",
+        "linear_state": "|".join("x".join(map(str, s)) for s in linear.state_shapes)
+        if linear
+        else "",
+        "linear_state_elements": str(sum(math.prod(s) for s in linear.state_shapes))
+        if linear
+        else "",
     }
 
 
@@ -223,13 +233,29 @@ def _as_placement(row: RankPlacement | dict) -> RankPlacement:
     from vllm_torchtpu.observability.placement_types import (
         AttentionSharding,
         DeviceIdentity,
+        LinearAttentionSharding,
     )
+
+    def _attention(a: dict) -> AttentionSharding:
+        shard = a["kv_token_shard"]
+        return AttentionSharding(
+            kind=a["kind"],
+            q_heads=tuple(a["q_heads"]),
+            kv_heads=tuple(a["kv_heads"]),
+            kv_replicated=a["kv_replicated"],
+            total_q_heads=a["total_q_heads"],
+            total_kv_heads=a["total_kv_heads"],
+            kv_token_shard=(shard[0], shard[1]) if shard else None,
+        )
 
     def group(g: dict) -> LayerGroup:
         return LayerGroup(
             root=g["root"],
             layers=tuple(g["layers"]),
-            attn=AttentionSharding(**g["attn"]) if g["attn"] else None,
+            attn=_attention(g["attn"]) if g["attn"] else None,
+            linear_attn=LinearAttentionSharding(**g["linear_attn"])
+            if g["linear_attn"]
+            else None,
         )
 
     return RankPlacement(

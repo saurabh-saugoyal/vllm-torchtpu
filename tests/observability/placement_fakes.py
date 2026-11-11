@@ -23,9 +23,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.v1.attention.backend import AttentionType
 
 from vllm_torchtpu.observability.placement_types import DeviceIdentity
 
@@ -38,9 +42,30 @@ def _bare(cls: type, **attrs) -> torch.nn.Module:
     return obj
 
 
-def attention(num_heads: int, num_kv_heads: int) -> Attention:
+def attention(
+    num_heads: int,
+    num_kv_heads: int,
+    sliding_window: int | None = None,
+    attn_type: AttentionType = AttentionType.DECODER,
+) -> Attention:
     """Per-rank head counts, as vLLM passes them to ``Attention``."""
-    return _bare(Attention, num_heads=num_heads, num_kv_heads=num_kv_heads)
+    return _bare(
+        Attention,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        sliding_window=sliding_window,
+        attn_type=attn_type,
+    )
+
+
+def mla_attention(num_heads: int) -> MLAAttention:
+    """Per-rank Q heads; vLLM sets ``num_kv_heads = 1`` (the latent KV)."""
+    return _bare(MLAAttention, num_heads=num_heads, num_kv_heads=1)
+
+
+def encoder_attention(num_heads: int) -> MMEncoderAttention:
+    """Vision-tower attention: per-rank heads, MHA (kv == q)."""
+    return _bare(MMEncoderAttention, num_heads=num_heads, num_kv_heads=num_heads)
 
 
 def qkv_proj(total_heads: int, total_kv_heads: int, tp_size: int) -> QKVParallelLinear:
@@ -71,7 +96,9 @@ class GatedDeltaNet(torch.nn.Module, MambaBase):
 
     @property
     def mamba_type(self):
-        return SimpleNamespace(name="GDN")  # the backend enum member, as read
+        return SimpleNamespace(
+            name="GDN"
+        )  # the backend enum member, as the provider reads it
 
     def get_state_dtype(self):
         return (torch.bfloat16, torch.float32)
@@ -80,16 +107,19 @@ class GatedDeltaNet(torch.nn.Module, MambaBase):
 class AttentionBlock(torch.nn.Module):
     """Owner of ``attn`` and ``qkv_proj`` (vLLM's ``LlamaAttention`` shape)."""
 
-    def __init__(self, total_heads, total_kv_heads, tp_size):
+    def __init__(self, total_heads, total_kv_heads, tp_size, encoder=False):
         super().__init__()
         self.qkv_proj = qkv_proj(total_heads, total_kv_heads, tp_size)
-        self.attn = attention(self.qkv_proj.num_heads, self.qkv_proj.num_kv_heads)
+        if encoder:
+            self.attn = encoder_attention(self.qkv_proj.num_heads)
+        else:
+            self.attn = attention(self.qkv_proj.num_heads, self.qkv_proj.num_kv_heads)
 
 
 class DenseLayer(torch.nn.Module):
-    def __init__(self, tp_size, heads=32, kv_heads=8):
+    def __init__(self, tp_size, heads=32, kv_heads=8, encoder=False):
         super().__init__()
-        self.self_attn = AttentionBlock(heads, kv_heads, tp_size)
+        self.self_attn = AttentionBlock(heads, kv_heads, tp_size, encoder=encoder)
 
 
 class FakeModel(torch.nn.Module):

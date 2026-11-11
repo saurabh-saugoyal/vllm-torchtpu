@@ -33,6 +33,7 @@ from vllm_torchtpu.observability.placement_types import (
     AttentionSharding,
     DeviceIdentity,
     LayerGroup,
+    LinearAttentionSharding,
     RankPlacement,
     label_names,
 )
@@ -151,6 +152,9 @@ def test_placement_labels_exact():
         "q_heads": "8-15",
         "kv_heads": "2-3",
         "kv_replicated": "False",
+        "kv_token_shard": "",
+        "linear_state": "",
+        "linear_state_elements": "",
     }
     assert list(layer) == label_names(LAYER_LABELS)
 
@@ -163,6 +167,21 @@ def test_rank_labels_without_device():
 def test_layer_labels_blank_for_kinds_not_present():
     labels = emitter.layer_labels(placement(1), LayerGroup("model", (1, 3)))
     assert labels["attention_kind"] == "" and labels["q_heads"] == ""
+    assert labels["linear_state"] == ""
+
+
+def test_layer_labels_for_linear_attention():
+    group = LayerGroup(
+        "model",
+        (0, 1, 2),
+        linear_attn=LinearAttentionSharding(
+            "GDN_ATTN", ((3, 1, 2048), (8, 128, 128)), False
+        ),
+    )
+    labels = emitter.layer_labels(placement(1), group)
+    assert labels["attention_kind"] == "GDN_ATTN" and labels["q_heads"] == ""
+    assert labels["linear_state"] == "3x1x2048|8x128x128"
+    assert labels["linear_state_elements"] == str(3 * 2048 + 8 * 128 * 128)
 
 
 def test_one_layer_row_per_group():
@@ -172,7 +191,13 @@ def test_one_layer_row_per_group():
             (0, 2),
             attn=AttentionSharding("full", (8, 16), (0, 1), True, 16, 2),
         ),
-        LayerGroup("model", (1, 3)),
+        LayerGroup(
+            "model",
+            (1, 3),
+            linear_attn=LinearAttentionSharding(
+                "GDN_ATTN", ((128, 4), (8, 128, 128)), False
+            ),
+        ),
         LayerGroup(
             "visual",
             (0,),
@@ -186,7 +211,13 @@ def test_one_layer_row_per_group():
         ("model", "1,3"),
         ("visual", "0"),
     ]
-    assert series[0]["kv_heads"] == "0" and series[1]["q_heads"] == ""
+    assert series[0]["kv_heads"] == "0" and series[1]["attention_kind"] == "GDN_ATTN"
+
+
+def test_layer_labels_dcp_token_shard():
+    sharded = AttentionSharding("full", (0, 8), (0, 2), False, 8, 2, (1, 2))
+    dcp = LayerGroup("model", (0,), attn=sharded)
+    assert emitter.layer_labels(placement(0), dcp)["kv_token_shard"] == "1/2"
 
 
 @pytest.mark.parametrize("bounds,text", [(None, ""), ((3, 4), "3"), ((8, 16), "8-15")])
@@ -347,6 +378,7 @@ def test_collect_uses_all_engines():
         emitter.collect_rank_placements(SimpleNamespace(engine_core=core))
     )
     assert [(p.dp_rank, p.rank) for p in got] == [(0, 0), (0, 1), (1, 0)]
+    assert got[0].layer_groups[0].attn.kv_token_shard is None
     assert core.fan_out_calls == [("collective_rpc", "get_placement", None, (), {})]
     assert isinstance(got[0].layer_groups[0].attn, AttentionSharding)
 

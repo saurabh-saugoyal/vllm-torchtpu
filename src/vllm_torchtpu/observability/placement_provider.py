@@ -15,7 +15,8 @@
 
 Runs once in each worker after the model is loaded. Reads vLLM's parallel
 groups, the device this process is pinned to, and the attention layers' own
-per-rank head counts. Nothing is computed from model names or config strings.
+per-rank head counts and state shapes. Nothing is computed from
+model names or config strings.
 """
 
 from __future__ import annotations
@@ -26,16 +27,23 @@ from collections import defaultdict
 
 import torch
 from vllm.distributed import parallel_state
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.attention.backend import AttentionType
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.observability.placement_types import (
     AttentionSharding,
     DeviceIdentity,
     LayerGroup,
+    LinearAttentionSharding,
     Range,
     RankPlacement,
 )
@@ -44,7 +52,10 @@ logger = init_logger(__name__)
 
 
 def describe_rank_placement(
-    rank: int, data_parallel_rank: int, node_rank: int, model: torch.nn.Module
+    rank: int,
+    data_parallel_rank: int,
+    node_rank: int,
+    model: torch.nn.Module,
 ) -> RankPlacement:
     """Placement of this rank. Observability must not fail model loading, so a
     failure is reported inside the record (``error``) and logged, never raised.
@@ -75,9 +86,13 @@ def describe_rank_placement(
 
 
 def _describe(
-    rank: int, data_parallel_rank: int, node_rank: int, model: torch.nn.Module
+    rank: int,
+    data_parallel_rank: int,
+    node_rank: int,
+    model: torch.nn.Module,
 ) -> RankPlacement:
     pp_group = parallel_state.get_pp_group()
+    dcp = _optional_group("get_dcp_group")
     return RankPlacement(
         rank=rank,
         dp_rank=data_parallel_rank,
@@ -86,20 +101,27 @@ def _describe(
         pp_rank=pp_group.rank_in_group,
         pp_size=pp_group.world_size,
         pcp_rank=_optional_group_rank("get_pcp_group"),
-        dcp_rank=_optional_group_rank("get_dcp_group"),
+        dcp_rank=dcp[0] if dcp else None,
         node_rank=node_rank,
         device=describe_device(),
         layers=_pipeline_layer_range(model),
-        layer_groups=describe_layer_groups(model),
+        layer_groups=describe_layer_groups(model, dcp=dcp),
     )
 
 
-def _optional_group_rank(getter_name: str) -> int | None:
-    """Rank in a context-parallel group; ``None`` when the vLLM build has none."""
+def _optional_group(getter_name: str) -> tuple[int, int] | None:
+    """``(rank, size)`` of a context-parallel group; ``None`` when the vLLM
+    build has none."""
     getter = getattr(parallel_state, getter_name, None)
     if getter is None:
         return None
-    return getter().rank_in_group
+    group = getter()
+    return (group.rank_in_group, group.world_size)
+
+
+def _optional_group_rank(getter_name: str) -> int | None:
+    group = _optional_group(getter_name)
+    return group[0] if group else None
 
 
 def describe_device() -> DeviceIdentity:
@@ -145,20 +167,22 @@ def _pipeline_layer_range(model: torch.nn.Module) -> Range | None:
     return None
 
 
-def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
+def describe_layer_groups(
+    model: torch.nn.Module, dcp: tuple[int, int] | None = None
+) -> tuple[LayerGroup, ...]:
     """Layers grouped by (root module, sharding).
 
     A layer is identified by its root module (the first name component, so a
-    vision tower, a draft model and the language model never merge) and its
-    index from vLLM's ``extract_layer_index``. Layers with equal attention
-    sharding collapse into one group, so a homogeneous model yields one
-    group and a hybrid model one per layer type.
+    vision tower and the language model never merge) and its index from
+    vLLM's ``extract_layer_index``. Layers with equal attention sharding
+    collapse into one group, so a homogeneous model yields one group and a
+    hybrid model one per layer type.
     """
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     modules = dict(model.named_modules())
     per_layer: dict[tuple[str, int | None], dict[str, object]] = defaultdict(dict)
     for name, module in modules.items():
-        kind, sharding = _describe_module(name, module, modules, tp_rank)
+        kind, sharding = _describe_module(name, module, modules, tp_rank, dcp)
         if kind is None:
             continue
         key = (name.split(".", 1)[0], _layer_index(name))
@@ -172,6 +196,7 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
             root=root,
             layers=() if index is None else (index,),
             attn=parts.get("attn"),  # type: ignore[arg-type]
+            linear_attn=parts.get("linear_attn"),  # type: ignore[arg-type]
         )
         key = candidate.sharding_key()
         if key in groups:
@@ -179,6 +204,7 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
                 root,
                 groups[key].layers + candidate.layers,
                 candidate.attn,
+                candidate.linear_attn,
             )
         else:
             groups[key] = candidate
@@ -186,10 +212,12 @@ def describe_layer_groups(model: torch.nn.Module) -> tuple[LayerGroup, ...]:
 
 
 def _layer_index(module_name: str) -> int | None:
-    try:
-        return extract_layer_index(module_name)
-    except ValueError:
+    """vLLM's layer index for ``model.layers.<i>.…``; ``None`` for modules
+    outside a layer stack (``lm_head``, a vision merger), which
+    ``extract_layer_index`` rejects."""
+    if not any(part.isdigit() for part in module_name.split(".")):
         return None
+    return extract_layer_index(module_name)
 
 
 def _describe_module(
@@ -197,25 +225,35 @@ def _describe_module(
     module: torch.nn.Module,
     modules: dict[str, torch.nn.Module],
     tp_rank: int,
+    dcp: tuple[int, int] | None,
 ):
     if isinstance(module, MambaBase):
-        # Linear attention / SSM: no heads to shard; its state is described
-        # separately.
-        return None, None
-    if isinstance(module, AttentionLayerBase):
-        return "attn", _attention_sharding(name, module, modules, tp_rank)
+        return "linear_attn", LinearAttentionSharding(
+            kind=module.mamba_type.name,
+            state_shapes=tuple(
+                tuple(int(d) for d in s) for s in module.get_state_shape()
+            ),
+            tp_replicated=bool(module.is_kv_cache_tp_replicated),
+        )
+    if isinstance(module, (AttentionLayerBase, MMEncoderAttention)):
+        return "attn", _attention_sharding(name, module, modules, tp_rank, dcp)
     return None, None
 
 
 def _attention_sharding(
     name: str,
-    layer: AttentionLayerBase,
+    layer: AttentionLayerBase | MMEncoderAttention,
     modules: dict[str, torch.nn.Module],
     tp_rank: int,
+    dcp: tuple[int, int] | None,
 ) -> AttentionSharding:
-    """``Attention`` and ``MLAAttention`` carry per-rank head counts, so GQA,
-    MQA and MLA are described alike. Totals come from the sibling
-    ``QKVParallelLinear`` when present (GQA).
+    """``Attention``, ``MLAAttention`` and the multimodal encoder's
+    ``MMEncoderAttention`` all carry per-rank head counts, so GQA, MQA, MLA and
+    vision attention are described alike (linear-attention layers are
+    ``MambaBase`` and dispatched before this). Totals and KV-head replication
+    come from the sibling ``QKVParallelLinear`` when present. MLA's single
+    latent KV head is not split by TP: every rank holds it, so it is reported
+    as one replicated head.
     """
     num_heads = int(layer.num_heads)
     num_kv_heads = int(layer.num_kv_heads)
@@ -229,7 +267,9 @@ def _attention_sharding(
         ),
         None,
     )
-    if qkv is not None:
+    if isinstance(layer, MLAAttention):
+        total_q, total_kv, replicas = num_heads * tp_size, 1, tp_size
+    elif qkv is not None:
         total_q, total_kv = int(qkv.total_num_heads), int(qkv.total_num_kv_heads)
         replicas = int(qkv.num_kv_head_replicas)
     else:
@@ -240,10 +280,23 @@ def _attention_sharding(
         else (tp_rank * num_kv_heads, (tp_rank + 1) * num_kv_heads)
     )
     return AttentionSharding(
-        kind="full",
+        kind=_attention_kind(layer),
         q_heads=(tp_rank * num_heads, (tp_rank + 1) * num_heads),
         kv_heads=kv_heads,
         kv_replicated=replicas > 1,
         total_q_heads=total_q,
         total_kv_heads=total_kv,
+        kv_token_shard=dcp if dcp and dcp[1] > 1 else None,
     )
+
+
+def _attention_kind(layer: AttentionLayerBase | MMEncoderAttention) -> str:
+    """``cross`` for encoder-decoder attention, ``sliding`` when the layer
+    attends over a window (sliding-window and chunked local attention), else
+    ``full``. Read from what ``Attention`` was built with; MLA and the
+    multimodal encoder's attention are always full."""
+    if not isinstance(layer, Attention):
+        return "full"
+    if layer.attn_type == AttentionType.ENCODER_DECODER:
+        return "cross"
+    return "sliding" if layer.sliding_window else "full"

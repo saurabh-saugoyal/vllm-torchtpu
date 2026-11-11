@@ -46,7 +46,12 @@ class DeviceIdentity:
 
 @dataclass(frozen=True)
 class AttentionSharding:
-    """Heads one tensor-parallel rank computes in a softmax-attention layer."""
+    """Heads one tensor-parallel rank computes in a softmax-attention layer.
+
+    ``kind`` is ``full``, ``sliding`` (sliding-window / chunked local
+    attention) or ``cross`` (encoder-decoder). ``kv_token_shard`` is
+    ``(dcp_rank, dcp_size)`` when decode context parallelism also splits the
+    KV *tokens* across ranks."""
 
     kind: str
     q_heads: Range
@@ -54,6 +59,18 @@ class AttentionSharding:
     kv_replicated: bool
     total_q_heads: int
     total_kv_heads: int
+    kv_token_shard: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class LinearAttentionSharding:
+    """Recurrent state one rank holds in a linear-attention / SSM layer
+    (Gated DeltaNet, Kimi Delta Attention, Mamba): ``kind`` is vLLM's
+    ``mamba_type`` and ``state_shapes`` its per-rank ``get_state_shape()``."""
+
+    kind: str
+    state_shapes: tuple[tuple[int, ...], ...]
+    tp_replicated: bool
 
 
 @dataclass(frozen=True)
@@ -63,9 +80,10 @@ class LayerGroup:
     root: str
     layers: tuple[int, ...]
     attn: AttentionSharding | None = None
+    linear_attn: LinearAttentionSharding | None = None
 
     def sharding_key(self) -> tuple:
-        return (self.root, self.attn)
+        return (self.root, self.attn, self.linear_attn)
 
 
 @dataclass(frozen=True)
@@ -165,16 +183,26 @@ RANK_LABELS: tuple[LabelSpec, ...] = (
 LAYER_LABELS: tuple[LabelSpec, ...] = (
     LabelSpec("engine", "[index] engine this rank belongs to"),
     LabelSpec("rank", "[index] worker process within the engine"),
-    LabelSpec("module", "[text] root module of the layers, e.g. 'model', 'visual'"),
+    LabelSpec(
+        "module",
+        "[text] root module of the layers, e.g. 'model', 'visual'",
+    ),
     LabelSpec("layer_subset", "[id list] layers of `module` sharing this sharding"),
     LabelSpec(
-        "attention_kind", "[text] 'full' (softmax, KV cache); '' if no attention"
+        "attention_kind",
+        "[text] 'full' | 'sliding' | 'cross' (softmax, KV cache) or vLLM's "
+        "linear-attention backend, e.g. 'GDN_ATTN', 'MAMBA2'; '' if no attention",
     ),
-    LabelSpec("q_heads", "[range] query heads this rank computes"),
+    LabelSpec("q_heads", "[range] query heads this rank computes (softmax kinds)"),
     LabelSpec("kv_heads", "[range] KV heads this rank holds; one head when replicated"),
     LabelSpec(
-        "kv_replicated", "[bool] num_kv_heads < TP: a KV head is shared by ranks"
+        "kv_replicated", "[bool] num_kv_heads < TP: a KV head is held by several ranks"
     ),
+    LabelSpec("kv_token_shard", "[r/n] decode-context shard of the KV tokens; '' if 1"),
+    LabelSpec(
+        "linear_state", "[shapes] per-rank recurrent state, e.g. '3x1x2048|8x128x128'"
+    ),
+    LabelSpec("linear_state_elements", "[count] elements of that state per rank"),
 )
 
 

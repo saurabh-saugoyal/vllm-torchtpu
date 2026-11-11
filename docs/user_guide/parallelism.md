@@ -176,12 +176,21 @@ vllm:rank_placement_info{engine="0", rank="1", tp_rank="1", pp_rank="0", pcp_ran
   host_visible_chips="", layers="0-31"} 1
 
 vllm:layer_placement_info{engine="0", rank="1", module="model", layer_subset="0-31",
-  attention_kind="full", q_heads="8-15", kv_heads="2-3", kv_replicated="False"} 1
+  attention_kind="full", q_heads="8-15", kv_heads="2-3", kv_replicated="False", kv_token_shard="",
+  linear_state="", linear_state_elements=""} 1
 ```
 
-A homogeneous model has exactly one layer series per rank. A hybrid or
-multimodal model has one per distinct layer type (`count by (engine, rank)
-(vllm:layer_placement_info)` shows how many).
+A homogeneous model has exactly one layer series per rank. A hybrid or multimodal model has one per distinct layer
+type (`count by (engine, rank) (vllm:layer_placement_info)` shows how many). For
+example, Qwen3.5-4B at TP=4 (three Gated-DeltaNet layers per full-attention
+layer) gives each rank two transformer-layer series:
+
+```text
+vllm:layer_placement_info{engine="0", rank="1", module="model", layer_subset="0-2,4-6,…,28-30",
+  attention_kind="GDN_ATTN", linear_state="3x1x2048|8x128x128", linear_state_elements="137216", …} 1
+vllm:layer_placement_info{engine="0", rank="1", module="model", layer_subset="3,7,11,…,31",
+  attention_kind="full", q_heads="4-7", kv_heads="1", kv_replicated="True", …} 1
+```
 
 To put chip and layers side by side, join on the rank:
 
@@ -249,8 +258,10 @@ platform pads heads or intermediate dimensions.
 | Label | Meaning |
 | :--- | :--- |
 | `module`, `layer_subset` | The root module (`model`, `language_model`, `visual`, ...) and the subset of its layers whose sharding this series describes, e.g. `0-27` or `1,3,5-7`. Layers with identical sharding are merged, so homogeneous models have one series per rank; a vision tower never merges with the language model. |
-| `attention_kind` | `full` for softmax attention with a KV cache (the only kind described so far); empty for a group without attention. |
+| `attention_kind` | `full` for softmax attention with a KV cache; `sliding` for sliding-window / chunked local attention (Gemma 2/3, GPT-OSS, Llama 4 — these layers form their own `layer_subset`); `cross` for encoder-decoder attention; or vLLM's linear-attention backend name (`GDN_ATTN` for Gated DeltaNet in Qwen3.5 / Qwen3-Next, `MAMBA2`, ...) for layers that keep a recurrent state instead. Empty for a group without attention. |
 | `q_heads`, `kv_heads` | Attention heads this tensor-parallel rank computes (inclusive ranges, from `QKVParallelLinear`). `kv_replicated="True"` means `num_kv_heads < tp_size` and the KV head is held by several TP ranks; MLA models (DeepSeek, Kimi) always report their one latent KV head this way. |
+| `kv_token_shard` | Under decode context parallelism the KV *tokens* are additionally split: `1/2` means this rank attends over the second half of each sequence's KV cache. Empty without DCP. |
+| `linear_state`, `linear_state_elements` | For linear-attention / state-space layers the rank holds a slice of the layer's recurrent state instead of KV heads. `linear_state` is the per-rank state shapes from `get_state_shape()`, e.g. `3x1x2048|8x128x128` (conv state, SSM state: 8 of 32 value heads on this rank) — one value for identity, not a list of filterable facts; `linear_state_elements` is the per-rank element count, comparable across ranks. |
 
 Set `VLLM_TPU_EMIT_PLACEMENT=0` to disable. `vllm:parallel_config_info` is
 skipped automatically on vLLM versions that publish it themselves. With
